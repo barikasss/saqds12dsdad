@@ -92,7 +92,12 @@ class SelectelClient:
 
         # --- Method 1: password auth (service user) ---
         if self.username and self._password and self._account_id:
-            # Step 1: domain-scoped token
+            log.debug(
+                "auth.attempt",
+                username=self.username,
+                account_id=self._account_id,
+                project_id=self._project_id[:8] if self._project_id else None,
+            )
             body: dict[str, Any] = {
                 "auth": {
                     "identity": {
@@ -105,51 +110,18 @@ class SelectelClient:
                             }
                         },
                     },
-                    "scope": {"domain": {"name": self._account_id}},
+                    **({"scope": {"project": {"id": self._project_id}}} if self._project_id else {}),
                 }
             }
             try:
-                resp = requests.post(self._IDENTITY_URL, json=body, timeout=15)
-                if resp.status_code in (200, 201):
-                    domain_token = resp.headers.get("X-Subject-Token", "")
-                    if domain_token:
-                        if self._project_id:
-                            # Step 2: exchange domain token for project-scoped token
-                            proj_body: dict[str, Any] = {
-                                "auth": {
-                                    "identity": {
-                                        "methods": ["token"],
-                                        "token": {"id": domain_token},
-                                    },
-                                    "scope": {"project": {"id": self._project_id}},
-                                }
-                            }
-                            proj_resp = requests.post(
-                                self._IDENTITY_URL, json=proj_body, timeout=15
-                            )
-                            if proj_resp.status_code in (200, 201):
-                                proj_token = proj_resp.headers.get("X-Subject-Token", "")
-                                if proj_token:
-                                    self._cache_ks_token(proj_token, proj_resp.json())
-                                    log.info("selectel.auth_project_ok", token=_mask_token(proj_token))
-                                    return proj_token
-                            elif proj_resp.status_code in (401, 403):
-                                raise SelectelAPIError(
-                                    proj_resp.status_code,
-                                    f"Project token exchange failed: {proj_resp.text[:200]}",
-                                )
-                        else:
-                            # No project_id — use domain-scoped token directly
-                            self._cache_ks_token(domain_token, resp.json())
-                            log.info("selectel.auth_password_ok", token=_mask_token(domain_token))
-                            return domain_token
-                elif resp.status_code in (401, 403):
-                    raise SelectelAPIError(
-                        resp.status_code,
-                        f"Password auth failed: {resp.text[:200]}\n\n"
-                        "Проверь SELECTEL_ACCOUNT_ID / SELECTEL_USERNAME / "
-                        "SELECTEL_PASSWORD / SELECTEL_PROJECT_ID в .env",
-                    )
+                resp = requests.post(self._IDENTITY_URL, json=body, timeout=10)
+                if resp.status_code == 201:
+                    token = resp.headers.get("X-Subject-Token", "")
+                    if token:
+                        self._cache_ks_token(token, resp.json())
+                        log.info("selectel.auth_ok", token=_mask_token(token))
+                        return token
+                raise SelectelAPIError(resp.status_code, resp.text)
             except SelectelAPIError:
                 raise
             except requests.RequestException:

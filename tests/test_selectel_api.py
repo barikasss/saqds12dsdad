@@ -52,18 +52,10 @@ def make_client(**kwargs) -> SelectelClient:
 
 @resp_lib.activate
 def test_auth_password_method():
-    # Step 1: password → domain-scoped token
     resp_lib.add(
         resp_lib.POST, IDENTITY_URL,
         json={"token": {"expires_at": EXPIRES_AT}},
-        headers={"X-Subject-Token": "ks-domain-token"},
-        status=201,
-    )
-    # Step 2: domain token → project-scoped token
-    resp_lib.add(
-        resp_lib.POST, IDENTITY_URL,
-        json={"token": {"expires_at": EXPIRES_AT}},
-        headers={"X-Subject-Token": "ks-project-token"},
+        headers={"X-Subject-Token": "ks-pw-token"},
         status=201,
     )
     resp_lib.add(resp_lib.GET, FIP_URL, json={"floatingips": []})
@@ -77,22 +69,47 @@ def test_auth_password_method():
     )
     client.list_floating_ips()
 
-    # Step 1 body: password with domain scope
-    step1 = json.loads(resp_lib.calls[0].request.body)
-    assert step1["auth"]["identity"]["methods"][0] == "password"
-    assert step1["auth"]["identity"]["password"]["user"]["name"] == "svc-user"
-    assert step1["auth"]["identity"]["password"]["user"]["domain"]["name"] == "123456"
-    assert step1["auth"]["scope"] == {"domain": {"name": "123456"}}
+    auth_body = json.loads(resp_lib.calls[0].request.body)
+    assert auth_body["auth"]["identity"]["methods"][0] == "password"
+    assert auth_body["auth"]["identity"]["password"]["user"]["name"] == "svc-user"
+    assert auth_body["auth"]["identity"]["password"]["user"]["domain"]["name"] == "123456"
+    assert auth_body["auth"]["scope"] == {"project": {"id": "proj-uuid"}}
 
-    # Step 2 body: token exchange with project scope
-    step2 = json.loads(resp_lib.calls[1].request.body)
-    assert step2["auth"]["identity"]["methods"][0] == "token"
-    assert step2["auth"]["identity"]["token"]["id"] == "ks-domain-token"
-    assert step2["auth"]["scope"] == {"project": {"id": "proj-uuid"}}
+    fip_req = resp_lib.calls[1].request
+    assert fip_req.headers["X-Auth-Token"] == "ks-pw-token"
 
-    # FIP request uses the project-scoped token
-    fip_req = resp_lib.calls[2].request
-    assert fip_req.headers["X-Auth-Token"] == "ks-project-token"
+
+# ---------------------------------------------------------------------------
+# 0b. test_auth_real_flow — full auth + list_floating_ips with mocks
+# ---------------------------------------------------------------------------
+
+@resp_lib.activate
+def test_auth_real_flow():
+    resp_lib.add(
+        resp_lib.POST, IDENTITY_URL,
+        json={"token": {"expires_at": EXPIRES_AT}},
+        headers={"X-Subject-Token": "project-tok"},
+        status=201,
+    )
+    resp_lib.add(resp_lib.GET, FIP_URL, json={"floatingips": [
+        {"id": "fip-1", "floating_ip_address": "87.228.90.5"},
+    ]})
+
+    client = SelectelClient(
+        account_id="478320",
+        username="Alena",
+        password="secret",
+        project_id="96536fd09a294164aaf5592a79b5356e",
+        region=REGION,
+    )
+
+    token = client._auth()
+    assert token == "project-tok"
+    assert len(token) > 0
+
+    fips = client.list_floating_ips()
+    assert isinstance(fips, list)
+    assert fips[0]["floating_ip_address"] == "87.228.90.5"
 
 
 # ---------------------------------------------------------------------------
