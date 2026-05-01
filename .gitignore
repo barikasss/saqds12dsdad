@@ -1,0 +1,12 @@
+__pycache__/
+*.pyc
+.venv/
+venv/
+.env
+config.yaml
+data/*.json
+data/*.log
+data/run_*.log
+.pytest_cache/
+.wl_cooldown
+*.egg-info/

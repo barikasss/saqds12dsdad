@@ -1,0 +1,5 @@
+requests[socks]>=2.31
+pyyaml>=6.0
+python-dotenv>=1.0
+structlog>=24.0
+aiohttp>=3.9

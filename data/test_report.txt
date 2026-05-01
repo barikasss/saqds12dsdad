@@ -1,0 +1,59 @@
+============================= test session starts ==============================
+platform linux -- Python 3.12.3, pytest-9.0.3, pluggy-1.6.0 -- /opt/FAK-RKN/white-ip-hunter/.venv/bin/python3
+cachedir: .pytest_cache
+rootdir: /opt/FAK-RKN/white-ip-hunter
+configfile: pytest.ini
+testpaths: tests
+plugins: mock-3.15.1, asyncio-1.3.0
+asyncio: mode=Mode.AUTO, debug=False, asyncio_default_fixture_loop_scope=None, asyncio_default_test_loop_scope=function
+collecting ... collected 47 items
+
+tests/test_checkers.py::test_ping_localhost PASSED                       [  2%]
+tests/test_checkers.py::test_ping_unreachable PASSED                     [  4%]
+tests/test_checkers.py::test_ping_subnet_concurrency PASSED              [  6%]
+tests/test_checkers.py::test_ping_handles_invalid_cidr PASSED            [  8%]
+tests/test_checkers.py::test_probe_localhost_open PASSED                 [ 10%]
+tests/test_checkers.py::test_probe_localhost_closed PASSED               [ 12%]
+tests/test_checkers.py::test_probe_subnet_async PASSED                   [ 14%]
+tests/test_checkers.py::test_probe_handles_timeout PASSED                [ 17%]
+tests/test_notifier.py::test_notify_success_call PASSED                  [ 19%]
+tests/test_notifier.py::test_html_escape PASSED                          [ 21%]
+tests/test_notifier.py::test_rate_limit PASSED                           [ 23%]
+tests/test_notifier.py::test_disabled_no_op PASSED                       [ 25%]
+tests/test_notifier.py::test_network_error_no_raise PASSED               [ 27%]
+tests/test_notifier.py::test_token_masked_in_logs PASSED                 [ 29%]
+tests/test_orchestrator.py::test_phase1_finds_white_in_priority PASSED   [ 31%]
+tests/test_orchestrator.py::test_phase2_iteration PASSED                 [ 34%]
+tests/test_orchestrator.py::test_dry_run_no_selectel_calls PASSED        [ 36%]
+tests/test_orchestrator.py::test_resume_skips_checked PASSED             [ 38%]
+tests/test_orchestrator.py::test_sigint_saves_state PASSED               [ 40%]
+tests/test_orchestrator.py::test_reroll_failure_warns PASSED             [ 42%]
+tests/test_selectel_api.py::test_auth_password_method PASSED             [ 44%]
+tests/test_selectel_api.py::test_auth_via_identity_token PASSED          [ 46%]
+tests/test_selectel_api.py::test_auth_fallback_direct PASSED             [ 48%]
+tests/test_selectel_api.py::test_list_floating_ips_success PASSED        [ 51%]
+tests/test_selectel_api.py::test_create_floating_ip_success PASSED       [ 53%]
+tests/test_selectel_api.py::test_delete_floating_ip_success PASSED       [ 55%]
+tests/test_selectel_api.py::test_reroll_until_in_subnet_finds_match PASSED [ 57%]
+tests/test_selectel_api.py::test_reroll_until_in_subnet_max_attempts PASSED [ 59%]
+tests/test_selectel_api.py::test_retry_on_503 PASSED                     [ 61%]
+tests/test_selectel_api.py::test_logs_no_secret PASSED                   [ 63%]
+tests/test_subnet_source.py::test_priority_first PASSED                  [ 65%]
+tests/test_subnet_source.py::test_seed_loaded PASSED                     [ 68%]
+tests/test_subnet_source.py::test_ripe_fetch_and_split PASSED            [ 70%]
+tests/test_subnet_source.py::test_cache_ttl PASSED                       [ 72%]
+tests/test_subnet_source.py::test_mark_and_get_state PASSED              [ 74%]
+tests/test_subnet_source.py::test_unchecked_excludes_marked PASSED       [ 76%]
+tests/test_subnet_source.py::test_atomic_write PASSED                    [ 78%]
+tests/test_subnet_source.py::test_stats PASSED                           [ 80%]
+tests/test_wl_api.py::test_submit_success PASSED                         [ 82%]
+tests/test_wl_api.py::test_submit_cooldown PASSED                        [ 85%]
+tests/test_wl_api.py::test_fetch_pending PASSED                          [ 87%]
+tests/test_wl_api.py::test_wait_for_completion PASSED                    [ 89%]
+tests/test_wl_api.py::test_check_subnet PASSED                           [ 91%]
+tests/test_wl_api.py::test_batch_split PASSED                            [ 93%]
+tests/test_wl_api.py::test_auth_error PASSED                             [ 95%]
+tests/test_wl_api.py::test_logs_no_secret PASSED                         [ 97%]
+tests/test_wl_api.py::test_is_subnet_white_threshold PASSED              [100%]
+
+============================== 47 passed in 3.11s ==============================

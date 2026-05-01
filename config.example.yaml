@@ -1,0 +1,35 @@
+selectel:
+  # Сервисный пользователь (password-метод Keystone)
+  account_id_env: SELECTEL_ACCOUNT_ID
+  username_env: SELECTEL_USERNAME
+  password_env: SELECTEL_PASSWORD
+  project_id_env: SELECTEL_PROJECT_ID
+  region: ru-3
+checkers:
+  icmp:
+    timeout: 1.0
+    concurrency: 32
+  tcp:
+    ports: [22, 80, 443]
+    timeout: 2.0
+    concurrency: 16
+  wlchecker:
+    base_url: "http://150.241.74.147:8082"
+    api_key_env: WLCHECKER_API_KEY
+    submit_cooldown_seconds: 300
+    poll_interval_seconds: 5
+    poll_timeout_seconds: 600
+notifier:
+  telegram:
+    bot_token_env: TG_BOT_TOKEN
+    chat_id_env: TG_CHAT_ID
+    proxy_url: ""  # socks5://127.0.0.1:10808
+search:
+  priority_subnets:
+    - 87.228.90.0/24
+    - 87.228.96.0/24
+    - 139.100.195.0/24
+    - 178.72.179.0/24
+  max_iterations: 1000
+  shuffle_after_priority: true
+  reroll_attempts_in_subnet: 15
