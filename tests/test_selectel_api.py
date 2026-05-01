@@ -52,10 +52,18 @@ def make_client(**kwargs) -> SelectelClient:
 
 @resp_lib.activate
 def test_auth_password_method():
+    # Step 1: password → domain-scoped token
     resp_lib.add(
         resp_lib.POST, IDENTITY_URL,
         json={"token": {"expires_at": EXPIRES_AT}},
-        headers={"X-Subject-Token": "ks-pw-token"},
+        headers={"X-Subject-Token": "ks-domain-token"},
+        status=201,
+    )
+    # Step 2: domain token → project-scoped token
+    resp_lib.add(
+        resp_lib.POST, IDENTITY_URL,
+        json={"token": {"expires_at": EXPIRES_AT}},
+        headers={"X-Subject-Token": "ks-project-token"},
         status=201,
     )
     resp_lib.add(resp_lib.GET, FIP_URL, json={"floatingips": []})
@@ -69,16 +77,22 @@ def test_auth_password_method():
     )
     client.list_floating_ips()
 
-    auth_body = json.loads(resp_lib.calls[0].request.body)
-    method = auth_body["auth"]["identity"]["methods"][0]
-    assert method == "password"
-    user_name = auth_body["auth"]["identity"]["password"]["user"]["name"]
-    assert user_name == "svc-user"
-    domain_name = auth_body["auth"]["identity"]["password"]["user"]["domain"]["name"]
-    assert domain_name == "123456"
+    # Step 1 body: password with domain scope
+    step1 = json.loads(resp_lib.calls[0].request.body)
+    assert step1["auth"]["identity"]["methods"][0] == "password"
+    assert step1["auth"]["identity"]["password"]["user"]["name"] == "svc-user"
+    assert step1["auth"]["identity"]["password"]["user"]["domain"]["name"] == "123456"
+    assert step1["auth"]["scope"] == {"domain": {"name": "123456"}}
 
-    fip_req = resp_lib.calls[1].request
-    assert fip_req.headers["X-Auth-Token"] == "ks-pw-token"
+    # Step 2 body: token exchange with project scope
+    step2 = json.loads(resp_lib.calls[1].request.body)
+    assert step2["auth"]["identity"]["methods"][0] == "token"
+    assert step2["auth"]["identity"]["token"]["id"] == "ks-domain-token"
+    assert step2["auth"]["scope"] == {"project": {"id": "proj-uuid"}}
+
+    # FIP request uses the project-scoped token
+    fip_req = resp_lib.calls[2].request
+    assert fip_req.headers["X-Auth-Token"] == "ks-project-token"
 
 
 # ---------------------------------------------------------------------------
