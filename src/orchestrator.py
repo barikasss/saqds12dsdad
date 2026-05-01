@@ -12,15 +12,69 @@ from pathlib import Path
 
 import structlog
 
+from datetime import timedelta
+
 from src.checkers.icmp_checker import ICMPChecker
 from src.checkers.tcp_checker import TCPChecker
 from src.checkers.wl_api import WLCheckerClient
 from src.config import load_config
 from src.notifier import TelegramNotifier
-from src.selectel_api import SelectelClient
+from src.selectel_api import SelectelAPIError, SelectelClient, SelectelRateLimitError
+from src.subnet_filter import SubnetFilter
 from src.subnet_source import SubnetSource, _atomic_write
 
 log = structlog.get_logger(__name__)
+
+
+# ---------------------------------------------------------------------------
+# AccountPool — round-robin over multiple Selectel accounts
+# ---------------------------------------------------------------------------
+
+class AccountPool:
+    """Round-robin scheduler for SelectelClient instances.
+
+    Tracks per-account rate-limit windows and skips blocked accounts.
+    """
+
+    def __init__(self, clients: list[SelectelClient]) -> None:
+        if not clients:
+            raise ValueError("AccountPool requires at least one client")
+        self._clients = clients
+        self._blocked_until: dict[int, datetime] = {}
+        self._idx = 0
+
+    def next(self) -> SelectelClient:
+        """Return the next non-blocked client in round-robin order."""
+        now = datetime.now(timezone.utc)
+        for i in range(len(self._clients)):
+            idx = (self._idx + i) % len(self._clients)
+            client = self._clients[idx]
+            cid = id(client)
+            if cid not in self._blocked_until or self._blocked_until[cid] <= now:
+                self._idx = (idx + 1) % len(self._clients)
+                return client
+        raise RuntimeError("All accounts are rate limited — call all_blocked() first")
+
+    def mark_rate_limited(
+        self, client: SelectelClient, until: datetime
+    ) -> None:
+        self._blocked_until[id(client)] = until
+        log.info(
+            "pool.account_rate_limited",
+            account=client.username,
+            until=until.isoformat(),
+        )
+
+    def all_blocked(self) -> bool:
+        now = datetime.now(timezone.utc)
+        return all(
+            id(c) in self._blocked_until and self._blocked_until[id(c)] > now
+            for c in self._clients
+        )
+
+    def reset_blocks(self) -> None:
+        self._blocked_until.clear()
+        log.info("pool.blocks_reset")
 
 
 def _fmt_elapsed(seconds: float) -> str:
@@ -74,16 +128,39 @@ class Orchestrator:
         cfg = self.cfg
 
         sel = cfg.get("selectel", {})
-        self.selectel = SelectelClient(
-            # password-method (service user) — preferred
-            account_id=os.environ.get(sel.get("account_id_env", "SELECTEL_ACCOUNT_ID"), ""),
-            username=os.environ.get(sel.get("username_env", "SELECTEL_USERNAME"), ""),
-            password=os.environ.get(sel.get("password_env", "SELECTEL_PASSWORD"), ""),
-            project_id=os.environ.get(sel.get("project_id_env", "SELECTEL_PROJECT_ID"), "") or None,
-            # legacy token fallback
-            api_token=os.environ.get(sel.get("api_token_env", "SELECTEL_API_TOKEN"), ""),
-            region=sel.get("region", "ru-3"),
-        )
+        self._zone: str = sel.get("availability_zone", sel.get("region", "ru-2"))
+
+        # Build client list from selectel_accounts[] or fall back to single account
+        accounts_cfg: list[dict] = cfg.get("selectel_accounts", [])
+        enabled_accounts = [a for a in accounts_cfg if a.get("enabled", True)]
+
+        if enabled_accounts:
+            clients: list[SelectelClient] = []
+            for acc in enabled_accounts:
+                clients.append(SelectelClient(
+                    account_id=acc.get("account_id", ""),
+                    username=acc.get("username", ""),
+                    password=os.environ.get(acc.get("password_env", ""), ""),
+                    project_id=acc.get("project_id") or None,
+                    region=acc.get("availability_zone", self._zone),
+                ))
+        else:
+            # Legacy single-account config
+            clients = [SelectelClient(
+                account_id=os.environ.get(sel.get("account_id_env", "SELECTEL_ACCOUNT_ID"), ""),
+                username=os.environ.get(sel.get("username_env", "SELECTEL_USERNAME"), ""),
+                password=os.environ.get(sel.get("password_env", "SELECTEL_PASSWORD"), ""),
+                project_id=os.environ.get(
+                    sel.get("project_id_env", "SELECTEL_PROJECT_ID"), ""
+                ) or None,
+                api_token=os.environ.get(
+                    sel.get("api_token_env", "SELECTEL_API_TOKEN"), ""
+                ),
+                region=self._zone,
+            )]
+
+        self._account_pool = AccountPool(clients)
+        self.selectel = clients[0]  # backward-compat reference
 
         c = cfg.get("checkers", {})
 
@@ -121,11 +198,15 @@ class Orchestrator:
         nt = cfg.get("notifier", {}).get("telegram", {})
         tg_token = os.environ.get(nt.get("bot_token_env", "TG_BOT_TOKEN"), "")
         tg_chat = os.environ.get(nt.get("chat_id_env", "TG_CHAT_ID"), "")
+        proxy_url = nt.get("proxy_url") or os.environ.get("TG_PROXY_URL") or None
         self.notifier = TelegramNotifier(
             bot_token=tg_token or "dummy",
             chat_id=tg_chat or "0",
             enabled=bool(tg_token and tg_chat),
+            proxy_url=proxy_url,
         )
+
+        self.ip_log_file: str = "data/ip_log.jsonl"
 
     # ------------------------------------------------------------------
     # Helpers
@@ -261,6 +342,111 @@ class Orchestrator:
         return False
 
     # ------------------------------------------------------------------
+    # IP logging and batch reroll
+    # ------------------------------------------------------------------
+
+    def _log_ip(
+        self,
+        ip: str,
+        subnet: str,
+        in_whitelist: bool,
+        action: str,
+        account: str,
+        zone: str,
+    ) -> None:
+        entry = {
+            "ts": datetime.now(timezone.utc).isoformat(),
+            "ip": ip,
+            "subnet": subnet,
+            "in_whitelist": in_whitelist,
+            "action": action,
+            "account": account,
+            "zone": zone,
+        }
+        path = Path(self.ip_log_file)
+        try:
+            path.parent.mkdir(exist_ok=True)
+            with open(path, "a") as f:
+                f.write(json.dumps(entry) + "\n")
+        except Exception as exc:
+            log.warning("orch.ip_log_error", error=str(exc))
+
+    def _batch_reroll(
+        self,
+        subnet_filter: SubnetFilter,
+        zone: str,
+        max_ips: int = 100,
+    ) -> tuple[dict | None, SelectelClient | None]:
+        """Create floating IPs from pool until one lands in a white subnet.
+
+        Round-robins over accounts, marks rate-limited accounts, sleeps 120s
+        when all accounts are blocked, then retries.
+        """
+        import ipaddress as _ip
+
+        found: dict | None = None
+        found_client: SelectelClient | None = None
+        ips_created = 0
+
+        while found is None and ips_created < max_ips:
+            if self._account_pool.all_blocked():
+                log.info("orch.all_accounts_blocked_sleeping", seconds=120)
+                time.sleep(120)
+                self._account_pool.reset_blocks()
+
+            if self._account_pool.all_blocked():
+                break
+
+            client = self._account_pool.next()
+
+            try:
+                fip = client.create_floating_ip_safe(availability_zone=zone)
+            except SelectelRateLimitError:
+                self._account_pool.mark_rate_limited(
+                    client,
+                    datetime.now(timezone.utc) + timedelta(seconds=120),
+                )
+                continue
+            except SelectelAPIError as exc:
+                log.warning("orch.fip_create_error", error=str(exc))
+                continue
+
+            ips_created += 1
+            ip = fip.get("floating_ip_address", "")
+            try:
+                net24 = str(_ip.IPv4Network(f"{ip}/24", strict=False))
+            except Exception:
+                net24 = ""
+
+            in_wl = subnet_filter.is_ip_in_whitelist(ip)
+            account_name = client.username or "?"
+
+            if in_wl:
+                if not self.no_icmp and ip:
+                    try:
+                        alive = self.icmp.ping_one(ip)
+                    except Exception:
+                        alive = True  # assume alive if ICMP unavailable
+                    if not alive:
+                        self._log_ip(ip, net24, in_wl, "deleted_icmp_fail", account_name, zone)
+                        try:
+                            client.delete_floating_ip(fip["id"])
+                        except Exception:
+                            pass
+                        continue
+                self._log_ip(ip, net24, True, "kept", account_name, zone)
+                found = fip
+                found_client = client
+            else:
+                self._log_ip(ip, net24, False, "deleted", account_name, zone)
+                try:
+                    client.delete_floating_ip(fip["id"])
+                except Exception as exc:
+                    log.warning("orch.fip_delete_error", fip_id=fip.get("id"), error=str(exc))
+
+        return found, found_client
+
+    # ------------------------------------------------------------------
     # Success flow
     # ------------------------------------------------------------------
 
@@ -272,9 +458,14 @@ class Orchestrator:
             log.info("orch.dry_run_reroll_skipped", cidr=target_cidr)
             sys.exit(0)
 
-        fip = self.selectel.reroll_until_in_subnet(
-            target_cidr, max_attempts=self.reroll_attempts
-        )
+        # Build filter from all white subnets found so far
+        white_cidrs = self.source.get_white_subnets()
+        if not white_cidrs:
+            white_cidrs = [target_cidr]
+        sf = SubnetFilter(white_cidrs)
+
+        max_ips = self.reroll_attempts * len(self._account_pool._clients)
+        fip, _ = self._batch_reroll(sf, self._zone, max_ips=max_ips)
 
         if fip:
             ip = fip.get("floating_ip_address", "")
@@ -361,6 +552,43 @@ class Orchestrator:
 # CLI: python -m src.orchestrator [options]
 # ---------------------------------------------------------------------------
 
+def _show_ip_log(log_file: str = "data/ip_log.jsonl") -> None:
+    path = Path(log_file)
+    if not path.exists():
+        print("No IP log yet.")
+        return
+    for raw in path.read_text().splitlines():
+        try:
+            e = json.loads(raw)
+        except json.JSONDecodeError:
+            continue
+        ts = e.get("ts", "")[:16].replace("T", " ")
+        ip = e.get("ip", "?").ljust(15)
+        subnet = e.get("subnet", "")
+        status = "✅ БЕЛЫЙ  " if e.get("in_whitelist") else "❌ удалён"
+        acc = e.get("account", "?")
+        print(f"[{ts}] {ip}  subnet={subnet}  {status}  ({acc})")
+
+
+def _show_accounts(cfg: dict) -> None:
+    from src.config import load_config
+    print("Selectel accounts:")
+    accounts = cfg.get("selectel_accounts", [])
+    if not accounts:
+        sel = cfg.get("selectel", {})
+        import os
+        uname = os.environ.get(sel.get("username_env", "SELECTEL_USERNAME"), "<not set>")
+        zone = sel.get("availability_zone", sel.get("region", "ru-2"))
+        print(f"  {uname:30s} zone={zone}  ✅ enabled (single-account mode)")
+        return
+    for acc in accounts:
+        uname = acc.get("username", "?")
+        zone = acc.get("availability_zone", "?")
+        enabled = acc.get("enabled", True)
+        status = "✅ enabled" if enabled else "❌ disabled"
+        print(f"  {uname:30s} zone={zone}  {status}")
+
+
 if __name__ == "__main__":
     import argparse
     import logging
@@ -376,7 +604,23 @@ if __name__ == "__main__":
     parser.add_argument("--phase", choices=["1", "2", "both"], default="both")
     parser.add_argument("--no-icmp", action="store_true",
                         help="Skip local ICMP pre-screening")
+    parser.add_argument("--zone", metavar="ZONE",
+                        help="Override availability zone (e.g. ru-2)")
+    parser.add_argument("--show-log", action="store_true",
+                        help="Print data/ip_log.jsonl and exit")
+    parser.add_argument("--accounts", action="store_true",
+                        help="Show configured Selectel accounts and exit")
     args = parser.parse_args()
+
+    # Info-only commands (no orchestrator needed)
+    if args.show_log:
+        _show_ip_log()
+        sys.exit(0)
+
+    if args.accounts:
+        from src.config import load_config as _lc
+        _show_accounts(_lc(args.config))
+        sys.exit(0)
 
     # Log file: data/run_YYYYMMDD_HHMMSS.log
     run_id = datetime.now().strftime("%Y%m%d_%H%M%S")

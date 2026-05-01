@@ -30,6 +30,10 @@ class SelectelAPIError(Exception):
         super().__init__(f"Selectel API {status}: {body[:200]}{hint}")
 
 
+class SelectelRateLimitError(SelectelAPIError):
+    """Raised by create_floating_ip_safe when account is rate limited (HTTP 429)."""
+
+
 class SelectelClient:
     _IDENTITY_URL = "https://cloud.api.selcloud.ru/identity/v3/auth/tokens"
 
@@ -47,7 +51,7 @@ class SelectelClient:
         self._region = region
         self._project_id = project_id
         self._account_id = account_id
-        self._username = username
+        self.username = username          # public for AccountPool logging
         self._password = password
         self._keystone_token: str | None = None
         self._token_expires: float = 0.0
@@ -87,14 +91,14 @@ class SelectelClient:
             return self._keystone_token
 
         # --- Method 1: password auth (service user) ---
-        if self._username and self._password and self._account_id:
+        if self.username and self._password and self._account_id:
             body: dict[str, Any] = {
                 "auth": {
                     "identity": {
                         "methods": ["password"],
                         "password": {
                             "user": {
-                                "name": self._username,
+                                "name": self.username,
                                 "domain": {"name": self._account_id},
                                 "password": self._password,
                             }
@@ -159,8 +163,16 @@ class SelectelClient:
             "or SELECTEL_API_TOKEN in .env",
         )
 
-    def _request_with_retry(self, method: str, url: str, **kwargs) -> requests.Response:
-        """Raw HTTP request with backoff retry on 429 and 5xx."""
+    def _request_with_retry(
+        self, method: str, url: str,
+        raise_on_rate_limit: bool = False,
+        **kwargs,
+    ) -> requests.Response:
+        """Raw HTTP request with backoff retry on 429 and 5xx.
+
+        If raise_on_rate_limit=True, HTTP 429 raises SelectelRateLimitError
+        instead of sleeping — used by create_floating_ip_safe for AccountPool.
+        """
         delays = [2, 4, 8]
         server_errors = 0
         conn_errors = 0
@@ -180,6 +192,8 @@ class SelectelClient:
                 continue
 
             if resp.status_code == 429:
+                if raise_on_rate_limit:
+                    raise SelectelRateLimitError(429, resp.text)
                 retry_after = int(resp.headers.get("Retry-After", 30))
                 log.warning("selectel.rate_limit", retry_after=retry_after)
                 time.sleep(retry_after)
@@ -205,10 +219,16 @@ class SelectelClient:
     def _request(self, method: str, url: str, **kwargs) -> requests.Response:
         """Authenticated request. Retries auth once on 401."""
         caller_headers: dict[str, str] = kwargs.pop("headers", {})
+        raise_on_rate_limit: bool = kwargs.pop("raise_on_rate_limit", False)
         for auth_attempt in range(2):
             merged = {"X-Auth-Token": self._auth(), **caller_headers}
             try:
-                return self._request_with_retry(method, url, headers=merged, **kwargs)
+                return self._request_with_retry(
+                    method, url,
+                    raise_on_rate_limit=raise_on_rate_limit,
+                    headers=merged,
+                    **kwargs,
+                )
             except SelectelAPIError as exc:
                 if exc.status == 401 and auth_attempt == 0:
                     log.warning("selectel.auth_expired_retry")
@@ -257,6 +277,32 @@ class SelectelClient:
         self._request("DELETE", f"{self._net_base}/floatingips/{fip_id}")
         log.info("selectel.fip_deleted", id=fip_id)
         return True
+
+    def create_floating_ip_safe(
+        self,
+        network_id: str | None = None,
+        availability_zone: str | None = None,
+    ) -> dict:
+        """Create a floating IP, raising SelectelRateLimitError on HTTP 429.
+
+        Unlike create_floating_ip, does NOT sleep on rate-limit — the caller
+        (AccountPool) is expected to handle the error and switch accounts.
+        """
+        if network_id is None:
+            nets = self.list_external_networks()
+            if not nets:
+                raise SelectelAPIError(0, "No external networks found in region")
+            network_id = nets[0]["id"]
+
+        resp = self._request(
+            "POST",
+            f"{self._net_base}/floatingips",
+            raise_on_rate_limit=True,
+            json={"floatingip": {"floating_network_id": network_id}},
+        )
+        fip: dict = resp.json()["floatingip"]
+        log.info("selectel.fip_created", id=fip["id"], ip=fip.get("floating_ip_address"))
+        return fip
 
     def list_servers(self) -> list[dict]:
         """[{id, name, status, addresses, ...}]"""

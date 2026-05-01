@@ -242,6 +242,11 @@ class SubnetSource:
         key = str(ipaddress.ip_network(cidr, strict=False))
         return self._load_state().get(key)
 
+    def get_white_subnets(self) -> list[str]:
+        """Return CIDRs whose state is 'white'."""
+        state = self._load_state()
+        return [cidr for cidr, entry in state.items() if entry.get("status") == "white"]
+
     def stats(self) -> dict:
         """{total_known, checked, white, dead, ambiguous, unchecked}"""
         all_subnets = self.get_all_subnets()
