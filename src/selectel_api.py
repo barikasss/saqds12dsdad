@@ -104,10 +104,9 @@ class SelectelClient:
                             }
                         },
                     },
+                    "scope": {"domain": {"name": self._account_id}},
                 }
             }
-            if self._project_id:
-                body["auth"]["scope"] = {"project": {"id": self._project_id}}
             try:
                 resp = requests.post(self._IDENTITY_URL, json=body, timeout=15)
                 if resp.status_code in (200, 201):
@@ -132,11 +131,10 @@ class SelectelClient:
         if self._api_token:
             token_body: dict[str, Any] = {
                 "auth": {
-                    "identity": {"methods": ["token"], "token": {"id": self._api_token}}
+                    "identity": {"methods": ["token"], "token": {"id": self._api_token}},
+                    **({"scope": {"domain": {"name": self._account_id}}} if self._account_id else {}),
                 }
             }
-            if self._project_id:
-                token_body["auth"]["scope"] = {"project": {"id": self._project_id}}
             try:
                 resp = requests.post(self._IDENTITY_URL, json=token_body, timeout=15)
                 if resp.status_code in (200, 201):
@@ -222,6 +220,8 @@ class SelectelClient:
         raise_on_rate_limit: bool = kwargs.pop("raise_on_rate_limit", False)
         for auth_attempt in range(2):
             merged = {"X-Auth-Token": self._auth(), **caller_headers}
+            if self._project_id:
+                merged["X-Auth-Project"] = self._project_id
             try:
                 return self._request_with_retry(
                     method, url,
