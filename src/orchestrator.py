@@ -458,14 +458,9 @@ class Orchestrator:
             log.info("orch.dry_run_reroll_skipped", cidr=target_cidr)
             sys.exit(0)
 
-        # Build filter from all white subnets found so far
-        white_cidrs = self.source.get_white_subnets()
-        if not white_cidrs:
-            white_cidrs = [target_cidr]
-        sf = SubnetFilter(white_cidrs)
-
-        max_ips = self.reroll_attempts * len(self._account_pool._clients)
-        fip, _ = self._batch_reroll(sf, self._zone, max_ips=max_ips)
+        fip = self.selectel.reroll_until_in_subnet(
+            target_cidr, max_attempts=self.reroll_attempts
+        )
 
         if fip:
             ip = fip.get("floating_ip_address", "")
