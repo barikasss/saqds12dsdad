@@ -18,8 +18,14 @@ def load_config(path: str = "config.yaml") -> dict[str, Any]:
     except FileNotFoundError:
         cfg = {}
 
-    proxy_url = os.environ.get("TG_PROXY_URL") or None
-    if proxy_url:
-        cfg.setdefault("checkers", {}).setdefault("wlchecker", {})["proxy_url"] = proxy_url
+    tg_proxy = os.environ.get("TG_PROXY_URL") or None
+    if tg_proxy:
+        cfg.setdefault("checkers", {}).setdefault("wlchecker", {})["proxy_url"] = tg_proxy
+
+    selectel_proxy = os.environ.get("SELECTEL_PROXY_URL") or None
+    if selectel_proxy:
+        cfg.setdefault("selectel", {})["proxy_url"] = selectel_proxy
+        for acc in cfg.get("selectel_accounts", []):
+            acc.setdefault("proxy_url", selectel_proxy)
 
     return cfg

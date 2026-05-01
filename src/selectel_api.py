@@ -46,6 +46,7 @@ class SelectelClient:
         account_id: str = "",
         username: str = "",
         password: str = "",
+        proxy_url: str | None = None,
     ) -> None:
         self._api_token = api_token
         self._region = region
@@ -53,6 +54,7 @@ class SelectelClient:
         self._account_id = account_id
         self.username = username          # public for AccountPool logging
         self._password = password
+        self._proxy_url = proxy_url
         self._keystone_token: str | None = None
         self._token_expires: float = 0.0
         self._session = requests.Session()
@@ -176,9 +178,10 @@ class SelectelClient:
         conn_errors = 0
         max_retries = 3
 
+        proxies = {"http": self._proxy_url, "https": self._proxy_url} if self._proxy_url else None
         while True:
             try:
-                resp = self._session.request(method, url, **kwargs)
+                resp = self._session.request(method, url, proxies=proxies, **kwargs)
             except requests.ConnectionError as exc:
                 conn_errors += 1
                 if conn_errors > max_retries:

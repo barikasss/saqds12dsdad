@@ -141,6 +141,7 @@ class Orchestrator:
                     password=os.environ.get(acc.get("password_env", ""), ""),
                     project_id=acc.get("project_id") or None,
                     region=acc.get("availability_zone", self._zone),
+                    proxy_url=acc.get("proxy_url") or None,
                 ))
         else:
             # Legacy single-account config
@@ -155,6 +156,7 @@ class Orchestrator:
                     sel.get("api_token_env", "SELECTEL_API_TOKEN"), ""
                 ),
                 region=self._zone,
+                proxy_url=sel.get("proxy_url") or None,
             )]
 
         self._account_pool = AccountPool(clients)
