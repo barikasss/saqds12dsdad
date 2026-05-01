@@ -32,6 +32,7 @@ def make_orch(
     orch.no_icmp = no_icmp
     orch._running = True
     orch._start_time = time.monotonic()
+    orch._zone = "ru-2"
     orch.stats = {
         "total_subnets": 0,
         "checked": 0,
@@ -95,57 +96,49 @@ def white_results(cidr_prefix: str, alive: int = 20) -> dict[str, bool]:
 def test_phase1_finds_white_in_priority(tmp_path):
     orch = make_orch(tmp_path, priority_subnets=["87.228.96.0/24"])
 
-    # 20/254 ≈ 7.9% alive; threshold=0.0 (any alive) → white
-    orch.wl.check_subnets_batch = MagicMock(
-        return_value={"87.228.96.0/24": white_results("87.228.96")}
-    )
-    orch.selectel.reroll_until_in_subnet = MagicMock(return_value={
+    # FIP lands inside the priority subnet
+    orch.selectel.create_floating_ip_safe = MagicMock(return_value={
         "id": "fip-1", "floating_ip_address": "87.228.96.5",
     })
+    # WLChecker final confirmation
+    orch.wl.check_subnet = MagicMock(return_value=white_results("87.228.96"))
 
     with pytest.raises(SystemExit) as exc_info:
         orch.run()
 
     assert exc_info.value.code == 0
-    orch.wl.check_subnets_batch.assert_called_once_with(["87.228.96.0/24"])
-    orch.selectel.reroll_until_in_subnet.assert_called_once_with(
-        "87.228.96.0/24", max_attempts=15
-    )
+    orch.selectel.create_floating_ip_safe.assert_called_once_with(availability_zone="ru-2")
+    orch.wl.check_subnet.assert_called_once_with("87.228.96.0/24")
     orch.notifier.notify_success.assert_called_once()
 
 
 # ---------------------------------------------------------------------------
-# 2. test_phase2_iteration — first 4 dead, 5th white → exit 0
+# 2. test_phase2_iteration — only the white subnet gets a FIP, triggers success
 # ---------------------------------------------------------------------------
 
 def test_phase2_iteration(tmp_path):
-    orch = make_orch(tmp_path, no_icmp=True, phase="2")
+    # priority_subnets defines what SubnetFilter treats as white in phase 2
+    orch = make_orch(tmp_path, no_icmp=True, phase="2",
+                     priority_subnets=["10.0.4.0/24"])
 
     subnets = [f"10.0.{i}.0/24" for i in range(5)]
     orch.source.get_unchecked = MagicMock(return_value=subnets)
     orch.source.refresh_from_ripe = MagicMock(return_value=5)
 
-    call_n = [0]
-
-    def fake_check_subnet(cidr, on_progress=None):
-        call_n[0] += 1
-        if call_n[0] == 5:
-            return white_results("10.0.4")   # 20/254 ≈ 7.9% > 5% → white
-        return dead_results(f"10.0.{call_n[0]-1}")
-
-    orch.wl.check_subnet = fake_check_subnet
-    orch.selectel.reroll_until_in_subnet = MagicMock(return_value={
+    # FIP lands inside the white subnet
+    orch.selectel.create_floating_ip_safe = MagicMock(return_value={
         "id": "fip-5", "floating_ip_address": "10.0.4.5",
     })
+    orch.wl.check_subnet = MagicMock(return_value=white_results("10.0.4"))
 
     with pytest.raises(SystemExit) as exc_info:
         orch.run()
 
     assert exc_info.value.code == 0
-    assert call_n[0] == 5
-    orch.selectel.reroll_until_in_subnet.assert_called_once_with(
-        "10.0.4.0/24", max_attempts=15
-    )
+    # Only one FIP created — for the single subnet that passed SubnetFilter
+    orch.selectel.create_floating_ip_safe.assert_called_once()
+    orch.wl.check_subnet.assert_called_once_with("10.0.4.0/24")
+    orch.notifier.notify_success.assert_called_once()
 
 
 # ---------------------------------------------------------------------------
@@ -155,17 +148,12 @@ def test_phase2_iteration(tmp_path):
 def test_dry_run_no_selectel_calls(tmp_path):
     orch = make_orch(tmp_path, priority_subnets=["87.228.90.0/24"], dry_run=True)
 
-    orch.wl.check_subnets_batch = MagicMock(
-        return_value={"87.228.90.0/24": white_results("87.228.90")}
-    )
-
     with pytest.raises(SystemExit) as exc_info:
         orch.run()
 
     assert exc_info.value.code == 0
-    # In dry_run, the reroll (which calls create_floating_ip) must NOT happen
-    orch.selectel.reroll_until_in_subnet.assert_not_called()
-    orch.selectel.create_floating_ip.assert_not_called()
+    # In dry_run, subnet passes SubnetFilter check but no FIP is ever created
+    orch.selectel.create_floating_ip_safe.assert_not_called()
 
 
 # ---------------------------------------------------------------------------
@@ -173,32 +161,32 @@ def test_dry_run_no_selectel_calls(tmp_path):
 # ---------------------------------------------------------------------------
 
 def test_resume_skips_checked(tmp_path):
-    orch = make_orch(tmp_path, no_icmp=True, phase="2")
+    # Two unchecked subnets are in the whitelist; three pre-marked dead are not
+    orch = make_orch(tmp_path, no_icmp=True, phase="2",
+                     priority_subnets=["10.0.4.0/24", "10.0.5.0/24"])
 
     # Pre-mark 3 subnets as dead (already checked)
     for i in range(1, 4):
         orch.source.mark(f"10.0.{i}.0/24", "dead")
 
-    # RIPE returns 5; get_unchecked returns only the 2 unmarked
     orch.source.refresh_from_ripe = MagicMock(return_value=5)
     orch.source.get_unchecked = MagicMock(
         return_value=[f"10.0.{i}.0/24" for i in range(4, 6)]
     )
 
-    checked: list[str] = []
+    # FIP lands outside any white subnet → gets deleted, no success
+    orch.selectel.create_floating_ip_safe = MagicMock(return_value={
+        "id": "fip-x", "floating_ip_address": "5.5.5.5",
+    })
+    orch.selectel.delete_floating_ip = MagicMock()
 
-    def fake_check(cidr, on_progress=None):
-        checked.append(cidr)
-        return dead_results("10.0.0")
+    orch.run()  # no white found → normal exit (no sys.exit)
 
-    orch.wl.check_subnet = fake_check
-    orch.run()   # no white found → normal exit (no sys.exit)
-
-    assert len(checked) == 2
-    assert "10.0.4.0/24" in checked
-    assert "10.0.5.0/24" in checked
-    for i in range(1, 4):
-        assert f"10.0.{i}.0/24" not in checked
+    # Only 2 unchecked subnets were iterated; FIP created and deleted for each
+    assert orch.selectel.create_floating_ip_safe.call_count == 2
+    assert orch.selectel.delete_floating_ip.call_count == 2
+    # Pre-marked dead subnets were not re-checked (get_unchecked returned only 2)
+    assert orch.stats["checked"] == 2
 
 
 # ---------------------------------------------------------------------------
@@ -224,22 +212,23 @@ def test_sigint_saves_state(tmp_path):
 
 
 # ---------------------------------------------------------------------------
-# 6. test_reroll_failure_warns
+# 6. test_fip_miss_deletes_and_continues
 # ---------------------------------------------------------------------------
 
-def test_reroll_failure_warns(tmp_path):
-    orch = make_orch(tmp_path, priority_subnets=["87.228.90.0/24"])
+def test_fip_miss_deletes_and_continues(tmp_path):
+    """FIP lands outside white subnet → deleted, loop continues, no success."""
+    orch = make_orch(tmp_path, priority_subnets=["87.228.90.0/24"], phase="1")
 
-    orch.wl.check_subnets_batch = MagicMock(
-        return_value={"87.228.90.0/24": white_results("87.228.90")}
-    )
-    orch.selectel.reroll_until_in_subnet = MagicMock(return_value=None)  # exhausted
+    # FIP always lands outside the white subnet
+    orch.selectel.create_floating_ip_safe = MagicMock(return_value={
+        "id": "fip-1", "floating_ip_address": "5.5.5.5",
+    })
+    orch.selectel.delete_floating_ip = MagicMock()
 
-    with pytest.raises(SystemExit) as exc_info:
-        orch.run()
+    orch.run()  # phase1 finds white subnet, creates FIP, deletes it, ends normally
 
-    assert exc_info.value.code == 1
-    orch.notifier.notify_warning.assert_called()
-    # Warning message must mention the subnet
-    warn_msg = orch.notifier.notify_warning.call_args[0][0]
-    assert "87.228.90.0/24" in warn_msg
+    orch.selectel.create_floating_ip_safe.assert_called_once()
+    orch.selectel.delete_floating_ip.assert_called_once_with("fip-1")
+    orch.notifier.notify_success.assert_not_called()
+    # WLChecker NOT called — FIP didn't pass SubnetFilter check
+    assert orch.stats["white_found"] == 0

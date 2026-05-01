@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import os
 from typing import Any
 
 import yaml
@@ -13,6 +14,12 @@ def load_config(path: str = "config.yaml") -> dict[str, Any]:
     load_dotenv()
     try:
         with open(path) as f:
-            return yaml.safe_load(f) or {}
+            cfg = yaml.safe_load(f) or {}
     except FileNotFoundError:
-        return {}
+        cfg = {}
+
+    proxy_url = os.environ.get("TG_PROXY_URL") or None
+    if proxy_url:
+        cfg.setdefault("checkers", {}).setdefault("wlchecker", {})["proxy_url"] = proxy_url
+
+    return cfg

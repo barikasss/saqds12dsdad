@@ -46,6 +46,7 @@ class WLCheckerClient:
         poll_timeout: int = 600,
         cooldown_state_file: str = ".wl_cooldown",
         request_timeout: int = 30,
+        proxy_url: str | None = None,
     ) -> None:
         self._base_url = base_url.rstrip("/")
         self._api_key = api_key
@@ -54,17 +55,21 @@ class WLCheckerClient:
         self._poll_timeout = poll_timeout
         self._cooldown_file = Path(cooldown_state_file)
         self._request_timeout = request_timeout
+        self._proxy_url = proxy_url
         self._session = requests.Session()
         self._session.headers["X-API-Key"] = api_key
 
     def _request(self, method: str, path: str, **kwargs) -> requests.Response:
         url = f"{self._base_url}{path}"
+        proxies = {"http": self._proxy_url, "https": self._proxy_url} if self._proxy_url else None
         conn_failures = 0
         max_retries = 3
 
         while True:
             try:
-                resp = self._session.request(method, url, timeout=self._request_timeout, **kwargs)
+                resp = self._session.request(
+                    method, url, timeout=self._request_timeout, proxies=proxies, **kwargs
+                )
             except requests.ConnectionError as exc:
                 conn_failures += 1
                 if conn_failures > max_retries:
