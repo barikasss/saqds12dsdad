@@ -54,7 +54,7 @@ class SelectelClient:
         self._account_id = account_id
         self.username = username          # public for AccountPool logging
         self._password = password
-        self._proxy_url = proxy_url
+        self._proxies = {"http": proxy_url, "https": proxy_url} if proxy_url else None
         self._keystone_token: str | None = None
         self._token_expires: float = 0.0
         self._session = requests.Session()
@@ -116,7 +116,7 @@ class SelectelClient:
                 }
             }
             try:
-                resp = requests.post(self._IDENTITY_URL, json=body, timeout=10)
+                resp = requests.post(self._IDENTITY_URL, json=body, timeout=10, proxies=self._proxies)
                 if resp.status_code == 201:
                     token = resp.headers.get("X-Subject-Token", "")
                     if token:
@@ -126,8 +126,9 @@ class SelectelClient:
                 raise SelectelAPIError(resp.status_code, resp.text)
             except SelectelAPIError:
                 raise
-            except requests.RequestException:
-                pass
+            except requests.RequestException as e:
+                log.warning("selectel.auth_request_error", error=str(e))
+                raise SelectelAPIError(0, f"Auth request failed: {e}")
 
         # --- Method 2: token exchange ---
         if self._api_token:
@@ -138,15 +139,16 @@ class SelectelClient:
                 }
             }
             try:
-                resp = requests.post(self._IDENTITY_URL, json=token_body, timeout=15)
+                resp = requests.post(self._IDENTITY_URL, json=token_body, timeout=15, proxies=self._proxies)
                 if resp.status_code in (200, 201):
                     ks_token = resp.headers.get("X-Subject-Token", "")
                     if ks_token:
                         self._cache_ks_token(ks_token, resp.json())
                         log.info("selectel.auth_token_ok", token=_mask_token(ks_token))
                         return ks_token
-            except requests.RequestException:
-                pass
+            except requests.RequestException as e:
+                log.warning("selectel.auth_request_error", error=str(e))
+                raise SelectelAPIError(0, f"Auth request failed: {e}")
 
             # Method 3: api_token direct
             log.info(
@@ -178,10 +180,9 @@ class SelectelClient:
         conn_errors = 0
         max_retries = 3
 
-        proxies = {"http": self._proxy_url, "https": self._proxy_url} if self._proxy_url else None
         while True:
             try:
-                resp = self._session.request(method, url, proxies=proxies, **kwargs)
+                resp = self._session.request(method, url, proxies=self._proxies, **kwargs)
             except requests.ConnectionError as exc:
                 conn_errors += 1
                 if conn_errors > max_retries:
