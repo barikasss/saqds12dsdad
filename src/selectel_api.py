@@ -104,7 +104,7 @@ class SelectelClient:
                             }
                         },
                     },
-                    "scope": {"domain": {"name": self._account_id}},
+                    **({"scope": {"project": {"id": self._project_id}}} if self._project_id else {}),
                 }
             }
             try:
