@@ -7,7 +7,7 @@ import os
 import signal
 import sys
 import time
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 import structlog
@@ -17,7 +17,7 @@ from src.checkers.tcp_checker import TCPChecker
 from src.checkers.wl_api import WLCheckerClient
 from src.config import load_config
 from src.notifier import TelegramNotifier
-from src.selectel_api import SelectelClient
+from src.selectel_api import SelectelClient, SelectelRateLimitError
 from src.subnet_filter import SubnetFilter
 from src.subnet_source import SubnetSource, _atomic_write
 
@@ -227,170 +227,144 @@ class Orchestrator:
         sys.exit(130)
 
     # ------------------------------------------------------------------
-    # Phase 1 — Quick Win on priority subnets
+    # Check existing floating IPs before starting the main loop
     # ------------------------------------------------------------------
 
-    def _phase1_quick_win(self) -> bool:
+    def _check_existing_fips(self, sf: SubnetFilter) -> None:
         import ipaddress as _ip
 
-        priority = self.source.priority_subnets
-        if not priority:
-            log.info("orch.phase1_skip", reason="no priority subnets in config")
-            return False
-
-        log.info("orch.phase1_start", count=len(priority))
-        sf = SubnetFilter(priority)
-
-        for cidr in priority:
+        log.info("orch.check_existing_fips")
+        for client in self._account_pool._clients:
             try:
-                net_addr = str(_ip.ip_network(cidr, strict=False).network_address)
-            except Exception:
+                fips = client.list_floating_ips()
+            except Exception as exc:
+                log.warning("orch.list_fips_error", account=client.username, error=str(exc))
                 continue
 
-            # Step 2: SubnetFilter check — no WLChecker
-            if not sf.is_ip_in_whitelist(net_addr):
-                self.stats["dead"] += 1
-                continue
+            for fip in fips:
+                ip = fip.get("floating_ip_address", "")
+                if not ip:
+                    continue
 
-            self.stats["checked"] += 1
-            log.info("orch.phase1_subnet_white", cidr=cidr)
+                try:
+                    subnet = str(_ip.ip_network(f"{ip}/24", strict=False))
+                except Exception:
+                    subnet = ""
+
+                account_name = client.username or "?"
+                log.info("orch.existing_fip", ip=ip, account=account_name)
+
+                if sf.is_ip_in_whitelist(ip):
+                    self._log_ip(ip, subnet, True, "existing_candidate", account_name, self._zone)
+                    self.notifier.notify_progress({
+                        **self._current_stats(),
+                        "message": f"Существующий IP {ip} в белом списке, проверяю...",
+                    })
+                    try:
+                        wl_res = self.wl.check_subnet(f"{ip}/32")
+                        if wl_res.get(ip):
+                            ev = {"source": "existing_fip", "wl_confirmed": True}
+                            self._success_flow(ip, fip, ev)
+                        else:
+                            self._log_ip(ip, subnet, True, "deleted_wl_rejected", account_name, self._zone)
+                            client.delete_floating_ip(fip["id"])
+                    except Exception as exc:
+                        log.warning("orch.existing_fip_wl_error", ip=ip, error=str(exc))
+                else:
+                    self._log_ip(ip, subnet, False, "deleted_not_in_whitelist", account_name, self._zone)
+                    try:
+                        client.delete_floating_ip(fip["id"])
+                    except Exception as exc:
+                        log.warning("orch.existing_fip_delete_error", ip=ip, error=str(exc))
+
+    # ------------------------------------------------------------------
+    # Main reroll loop
+    # ------------------------------------------------------------------
+
+    def _reroll_loop(self, sf: SubnetFilter) -> None:
+        import ipaddress as _ip
+
+        log.info("orch.reroll_loop_start")
+        attempts = 0
+
+        while self._running:
+            if self._account_pool.all_blocked():
+                log.info("orch.all_accounts_blocked_sleeping", seconds=120)
+                time.sleep(120)
+                self._account_pool.reset_blocks()
+
+            client = self._account_pool.next()
+            attempts += 1
 
             if self.dry_run:
-                log.info("orch.dry_run_fip_skipped", cidr=cidr)
+                log.info("orch.dry_run_reroll_skipped", attempt=attempts)
                 sys.exit(0)
 
-            # Step 3a: create floating IP
             try:
-                fip = self.selectel.create_floating_ip_safe(availability_zone=self._zone)
+                fip = client.create_floating_ip_safe(availability_zone=client._region)
+            except SelectelRateLimitError:
+                self._account_pool.mark_rate_limited(
+                    client,
+                    datetime.now(timezone.utc) + timedelta(seconds=120),
+                )
+                continue
             except Exception as exc:
-                log.warning("orch.phase1_fip_error", cidr=cidr, error=str(exc))
+                log.warning("orch.fip_create_error", account=client.username, error=str(exc))
+                time.sleep(5)
                 continue
 
             ip = fip.get("floating_ip_address", "")
-
-            # Step 3b: check if FIP landed in white subnet
-            if sf.is_ip_in_whitelist(ip):
-                # Step 3c: WLChecker final confirmation
-                try:
-                    wl_res = self.wl.check_subnet(cidr)
-                    if self.wl.is_subnet_white(wl_res, threshold=0.0):
-                        ev = {
-                            "wl_alive": sum(1 for v in wl_res.values() if v),
-                            "wl_total": len(wl_res),
-                        }
-                        self.source.mark(cidr, "white", ev)
-                        self.stats["white_found"] += 1
-                        log.info("orch.phase1_white", cidr=cidr, ip=ip)
-                        self._success_flow(ip, cidr, fip, ev)
-                        return True
-                except Exception as exc:
-                    log.warning("orch.phase1_wl_error", cidr=cidr, error=str(exc))
-
-            # Step 4: FIP not in white subnet or WLChecker failed — delete
-            try:
-                self.selectel.delete_floating_ip(fip["id"])
-            except Exception:
-                pass
-            self.stats["dead"] += 1
-
-        log.info("orch.phase1_all_failed")
-        return False
-
-    # ------------------------------------------------------------------
-    # Phase 2 — Wide search over all known subnets
-    # ------------------------------------------------------------------
-
-    def _phase2_wide_search(self) -> bool:
-        import ipaddress as _ip
-
-        log.info("orch.phase2_start")
-
-        try:
-            count = self.source.refresh_from_ripe()
-            log.info("orch.ripe_refreshed", count=count)
-        except Exception as exc:
-            log.warning("orch.ripe_failed", error=str(exc))
-
-        # SubnetFilter from known white subnets + priority list
-        white_cidrs = list(set(
-            (self.source.get_white_subnets() or []) + (self.source.priority_subnets or [])
-        ))
-        sf = SubnetFilter(white_cidrs)
-
-        unchecked = self.source.get_unchecked(shuffle=self.shuffle)
-        total = len(unchecked)
-        self.stats["total_subnets"] = total
-        limit = min(total, self.max_iter)
-
-        for i, cidr in enumerate(unchecked[:limit], 1):
-            if not self._running:
-                break
-
-            # Step 2: SubnetFilter check — no WLChecker
-            try:
-                net_addr = str(_ip.ip_network(cidr, strict=False).network_address)
-            except Exception:
-                continue
-
-            if not sf.is_ip_in_whitelist(net_addr):
-                print(f"[phase=2 i={i}/{limit}] subnet={cidr} filter=skip", flush=True)
-                self.source.mark(cidr, "dead", {"reason": "not_in_whitelist"})
-                self.stats["dead"] += 1
-                self.stats["checked"] += 1
-                continue
-
-            print(f"[phase=2 i={i}/{limit}] subnet={cidr} filter=white → FIP...", flush=True)
+            account_name = client.username or "?"
             self.stats["checked"] += 1
 
-            if self.dry_run:
-                log.info("orch.dry_run_fip_skipped", cidr=cidr)
-                self.stats["white_found"] += 1
-                sys.exit(0)
-
-            # Step 3a: create floating IP
             try:
-                fip = self.selectel.create_floating_ip_safe(availability_zone=self._zone)
-            except Exception as exc:
-                log.warning("orch.phase2_fip_error", cidr=cidr, error=str(exc))
-                continue
+                subnet = str(_ip.ip_network(f"{ip}/24", strict=False))
+            except Exception:
+                subnet = ""
 
-            ip = fip.get("floating_ip_address", "")
+            log.info("orch.fip_received", ip=ip, attempt=attempts, account=account_name)
 
-            # Step 3b: check if FIP landed in white subnet
             if sf.is_ip_in_whitelist(ip):
-                # Step 3c: WLChecker final confirmation
+                self._log_ip(ip, subnet, True, "candidate", account_name, self._zone)
+                self.notifier.notify_progress({
+                    **self._current_stats(),
+                    "message": f"Кандидат {ip}, проверяю через WLChecker...",
+                })
+                log.info("orch.fip_candidate", ip=ip, attempt=attempts)
+
                 try:
-                    wl_res = self.wl.check_subnet(cidr)
-                    wl_alive = sum(1 for v in wl_res.values() if v)
-                    ev = {"wl_alive": wl_alive, "wl_total": len(wl_res)}
-
-                    if self.wl.is_subnet_white(wl_res, threshold=0.05):
-                        self.source.mark(cidr, "white", ev)
+                    wl_res = self.wl.check_subnet(f"{ip}/32")
+                    if wl_res.get(ip):
                         self.stats["white_found"] += 1
-                        self._success_flow(ip, cidr, fip, ev)
-                        return True
+                        self._log_ip(ip, subnet, True, "kept", account_name, self._zone)
+                        ev = {"wl_confirmed": True, "attempts": attempts}
+                        self._success_flow(ip, fip, ev)
+                        return
+                    else:
+                        log.info("orch.fip_wl_rejected", ip=ip)
+                        self._log_ip(ip, subnet, True, "deleted_wl_rejected", account_name, self._zone)
+                        self.stats["dead"] += 1
                 except Exception as exc:
-                    log.warning("orch.phase2_wl_error", cidr=cidr, error=str(exc))
+                    log.warning("orch.wl_error", ip=ip, error=str(exc))
+                    self.stats["dead"] += 1
 
-                self.source.mark(cidr, "dead", {"reason": "wl_not_confirmed"})
-                self.stats["dead"] += 1
+                try:
+                    client.delete_floating_ip(fip["id"])
+                except Exception as exc:
+                    log.warning("orch.fip_delete_error", fip_id=fip.get("id"), error=str(exc))
             else:
-                self.source.mark(cidr, "dead", {"reason": "fip_not_in_whitelist"})
+                self._log_ip(ip, subnet, False, "deleted_not_in_whitelist", account_name, self._zone)
                 self.stats["dead"] += 1
+                try:
+                    client.delete_floating_ip(fip["id"])
+                except Exception as exc:
+                    log.warning("orch.fip_delete_error", fip_id=fip.get("id"), error=str(exc))
 
-            # Step 4: delete FIP
-            try:
-                self.selectel.delete_floating_ip(fip["id"])
-            except Exception as exc:
-                log.warning("orch.fip_delete_error", fip_id=fip.get("id"), error=str(exc))
-
-            if i % 5 == 0:
-                self.notifier.notify_progress({**self._current_stats(), "current_subnet": cidr})
-
-        return False
+            if attempts % 10 == 0:
+                self.notifier.notify_progress(self._current_stats())
 
     # ------------------------------------------------------------------
-    # IP logging and batch reroll
+    # IP logging
     # ------------------------------------------------------------------
 
     def _log_ip(
@@ -423,17 +397,22 @@ class Orchestrator:
     # Success flow
     # ------------------------------------------------------------------
 
-    def _success_flow(self, ip: str, target_cidr: str, fip: dict, evidence: dict) -> None:
-        log.info("orch.success_flow", ip=ip, cidr=target_cidr)
+    def _success_flow(self, ip: str, fip: dict, evidence: dict) -> None:
+        import ipaddress as _ip
+        try:
+            cidr = str(_ip.ip_network(f"{ip}/24", strict=False))
+        except Exception:
+            cidr = ip
+        log.info("orch.success_flow", ip=ip, cidr=cidr)
         evidence["floating_ip_id"] = fip.get("id", "")
         self.notifier.notify_success(
             ip=ip,
-            subnet=target_cidr,
+            subnet=cidr,
             evidence=evidence,
             stats=self._current_stats(),
         )
-        self._save_found_ip(ip, target_cidr, fip, evidence)
-        log.info("orch.ip_found", ip=ip, cidr=target_cidr)
+        self._save_found_ip(ip, cidr, fip, evidence)
+        log.info("orch.ip_found", ip=ip, cidr=cidr)
         sys.exit(0)
 
     def _save_found_ip(
@@ -462,23 +441,12 @@ class Orchestrator:
     # ------------------------------------------------------------------
 
     def run(self) -> None:
-        log.info(
-            "orch.start",
-            phase=self.phase,
-            dry_run=self.dry_run,
-            resume=self.resume,
-            no_icmp=self.no_icmp,
-        )
+        log.info("orch.start", dry_run=self.dry_run, resume=self.resume)
+        sf = SubnetFilter(self.source.priority_subnets)
         try:
-            if self.phase in ("1", "both"):
-                if self._phase1_quick_win():
-                    return
-
-            if self.phase in ("2", "both"):
-                self._phase2_wide_search()
-
+            self._check_existing_fips(sf)
+            self._reroll_loop(sf)
             log.info("orch.done", stats=self._current_stats())
-
         except (SystemExit, KeyboardInterrupt):
             raise
         except Exception as exc:
