@@ -104,7 +104,7 @@ class SelectelClient:
                             }
                         },
                     },
-                    **({"scope": {"project": {"id": self._project_id}}} if self._project_id else {}),
+                    "scope": {"domain": {"name": self._account_id}},
                 }
             }
             try:
@@ -222,7 +222,6 @@ class SelectelClient:
             merged = {"X-Auth-Token": self._auth(), **caller_headers}
             if self._project_id:
                 merged["X-Auth-Project"] = self._project_id
-                merged["X-Project-Id"] = self._project_id
             try:
                 return self._request_with_retry(
                     method, url,
