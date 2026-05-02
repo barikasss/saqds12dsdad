@@ -275,7 +275,10 @@ class Orchestrator:
         )
 
         self.source = SubnetSource(priority_subnets=priority)
-        self.filter = SubnetFilter(priority)
+        self.filter = SubnetFilter.from_file(
+            file_path="data/white_subnets.txt",
+            extra_cidrs=priority,
+        )
 
         nt = cfg.get("notifier", {}).get("telegram", {})
         tg_token = os.environ.get(nt.get("bot_token_env", "TG_BOT_TOKEN"), "")
@@ -380,6 +383,10 @@ class Orchestrator:
             except Exception as exc:
                 log.warning("orch.cleanup_list_error",
                             account=getattr(client, "username", "?"), error=str(exc))
+                self._account_pool.mark_rate_limited(
+                    client,
+                    datetime.now(timezone.utc) + timedelta(seconds=120),
+                )
                 continue
 
             for fip in fips:

@@ -79,6 +79,31 @@ class SubnetFilter:
         log.info("subnet_filter.loaded", white_count=len(white))
         return cls(white)
 
+    @classmethod
+    def from_file(
+        cls,
+        file_path: str = "data/white_subnets.txt",
+        extra_cidrs: list[str] | None = None,
+    ) -> "SubnetFilter":
+        """Build filter from a plain-text file (one CIDR per line).
+
+        Lines starting with '#' and blank lines are ignored.
+        extra_cidrs are merged in (e.g. priority_subnets from config).
+        """
+        cidrs: list[str] = []
+        try:
+            for line in Path(file_path).read_text().splitlines():
+                line = line.strip()
+                if line and not line.startswith("#"):
+                    cidrs.append(line)
+        except FileNotFoundError:
+            log.warning("subnet_filter.file_not_found", path=file_path)
+        if extra_cidrs:
+            cidrs.extend(extra_cidrs)
+        log.info("subnet_filter.loaded_from_file",
+                 path=file_path, total=len(cidrs))
+        return cls(cidrs)
+
 
 # ---------------------------------------------------------------------------
 # CLI: python -m src.subnet_filter --check <IP>
