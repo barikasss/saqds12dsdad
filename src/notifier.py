@@ -116,6 +116,21 @@ class TelegramNotifier:
         )
         return self.notify(text)
 
+    def notify_white_found(
+        self,
+        ip: str,
+        subnet: str,
+        icmp_alive: int,
+    ) -> bool:
+        e = html.escape
+        text = (
+            f"🎯 НАЙДЕН! "
+            f"IP: <code>{e(ip)}</code> "
+            f"Подсеть: <code>{e(subnet)}</code> "
+            f"ICMP: {icmp_alive}/254"
+        )
+        return self.notify(text)
+
     def notify_warning(
         self,
         message: str,
@@ -143,15 +158,21 @@ class TelegramNotifier:
 
     def notify_progress(self, stats: dict) -> bool:
         e = html.escape
+
+        account_counts = stats.get('account_counts', {})
+        accounts_str = ' | '.join(
+            f"{e(str(name))}: {count}/{12}"
+            for name, count in account_counts.items()
+        ) if account_counts else '0/12'
+
         text = (
-            "📊 <b>Прогресс поиска</b>\n"
-            f"Проверено: {e(str(stats.get('checked', '?')))}"
-            f"/{e(str(stats.get('total', '?')))}\n"
-            f"Белых: {e(str(stats.get('white', '?')))}, "
-            f"Мёртвых: {e(str(stats.get('dead', '?')))}, "
-            f"Спорных: {e(str(stats.get('ambiguous', '?')))}\n"
-            f"Текущая: <code>{e(str(stats.get('current_subnet', '')))}</code>\n"
-            f"Время работы: {e(str(stats.get('elapsed', '?')))}"
+            "📊 Прогресс\n"
+            f"🔄 Создано: {e(str(stats.get('total_created', '?')))} FIP\n"
+            f"✅ Белых: {e(str(stats.get('white_found', '?')))}\n"
+            f"❌ Не в списке: {e(str(stats.get('deleted_not_in_whitelist', '?')))}\n"
+            f"💀 Мёртвых: {e(str(stats.get('dead', '?')))}\n"
+            f"⏱ {e(str(stats.get('elapsed', '?')))}\n"
+            f"{accounts_str}"
         )
         return self.notify(text)
 

@@ -195,6 +195,7 @@ class Orchestrator:
         self.no_icmp = no_icmp
         self._running = True
         self._start_time = time.monotonic()
+        self._last_progress_notify = time.monotonic()
         self._iteration = 0
         self._pending_tasks: list[SubnetTask] = []
         self.stats: dict = {
@@ -202,6 +203,7 @@ class Orchestrator:
             "white_found": 0,
             "dead": 0,
             "deleted_not_in_whitelist": 0,
+            "total_created": 0,
             "start_time": datetime.now(timezone.utc).isoformat(),
         }
 
@@ -329,6 +331,17 @@ class Orchestrator:
         except Exception as exc:
             log.warning("orch.delete_failed", fip_id=fip_id, error=str(exc))
 
+    def _get_account_fips_counts(self) -> dict[str, int]:
+        """Returns {account_name: fips_count} for current FIPs."""
+        counts: dict[str, int] = {}
+        for client in self._account_pool.clients:
+            try:
+                fips = client.list_floating_ips()
+                counts[client.username] = len(fips)
+            except Exception:
+                counts[client.username] = 0
+        return counts
+
     # ------------------------------------------------------------------
     # Shutdown
     # ------------------------------------------------------------------
@@ -349,6 +362,7 @@ class Orchestrator:
             time.sleep(2)
 
         try:
+            log.info("orch.notify_attempt", type="warning")
             self.notifier.notify_warning(
                 "Остановлено пользователем", context={"signal": int(signum)}
             )
@@ -393,6 +407,7 @@ class Orchestrator:
                     break
 
                 fips_count += 1  # counts toward MAX even if we delete below
+                self.stats["total_created"] += 1
                 ip = fip.get("floating_ip_address", "")
                 if not ip:
                     continue
@@ -513,10 +528,12 @@ class Orchestrator:
     # ------------------------------------------------------------------
 
     def _current_stats(self) -> dict:
+        account_counts = self._get_account_fips_counts()
         return {
             **self.stats,
             "elapsed": _fmt_elapsed(time.monotonic() - self._start_time),
             "pending": len(self._pending_tasks),
+            "account_counts": account_counts,
         }
 
     # ------------------------------------------------------------------
@@ -538,17 +555,18 @@ class Orchestrator:
                 winner = self._decision_phase()
 
                 if winner:
-                    self.notifier.notify_success(
-                        ip=winner.fip_ip,
-                        subnet=winner.cidr,
-                        evidence={
-                            "icmp_result": winner.icmp_result,
-                            "wl_result": winner.wl_result,
-                            "account": winner.account,
-                            "floating_ip_id": winner.fip_id,
-                        },
-                        stats=self._current_stats(),
-                    )
+                    log.info("orch.notify_attempt", type="success")
+                    try:
+                        ip_addr = winner.fip_ip
+                        subnet = winner.cidr
+                        alive_count = 254 if winner.icmp_result else 0
+                        self.notifier.notify_white_found(
+                            ip=ip_addr,
+                            subnet=subnet,
+                            icmp_alive=alive_count,
+                        )
+                    except Exception:
+                        pass
                     self._save_found_ip(winner)
                     log.info("orch.found",
                              ip=winner.fip_ip, cidr=winner.cidr)
@@ -556,10 +574,13 @@ class Orchestrator:
                         self._pending_tasks.remove(winner)
                     sys.exit(0)
 
-                if self._iteration % 10 == 0:
+                elapsed_since_notify = time.monotonic() - self._last_progress_notify
+                if elapsed_since_notify >= 600:
                     log.info("orch.progress", **self._current_stats())
+                    log.info("orch.notify_attempt", type="progress")
                     try:
                         self.notifier.notify_progress(self._current_stats())
+                        self._last_progress_notify = time.monotonic()
                     except Exception:
                         pass
 
@@ -582,6 +603,7 @@ class Orchestrator:
             import traceback as _tb
             log.exception("orch.unhandled")
             try:
+                log.info("orch.notify_attempt", type="error")
                 self.notifier.notify_error(str(exc), _tb.format_exc())
             except Exception:
                 pass
