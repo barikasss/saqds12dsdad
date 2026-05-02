@@ -204,6 +204,7 @@ class Orchestrator:
             "dead": 0,
             "deleted_not_in_whitelist": 0,
             "total_created": 0,
+            "suspects": 0,
             "start_time": datetime.now(timezone.utc).isoformat(),
         }
 
@@ -324,6 +325,29 @@ class Orchestrator:
         except Exception as exc:
             log.warning("orch.save_found_failed", error=str(exc))
 
+    def _save_suspect_ip(self, task: SubnetTask, reason: str) -> None:
+        """Save FIP that passed ICMP but WL rejected — user must verify manually."""
+        path = Path("data") / "suspects.json"
+        try:
+            path.parent.mkdir(exist_ok=True)
+            try:
+                existing: list = json.loads(path.read_text())
+            except (FileNotFoundError, json.JSONDecodeError):
+                existing = []
+            existing.append({
+                "ip": task.fip_ip,
+                "cidr": task.cidr,
+                "fip_id": task.fip_id,
+                "account": task.account,
+                "icmp_result": task.icmp_result,
+                "wl_result": task.wl_result,
+                "reason": reason,
+                "found_at": datetime.now(timezone.utc).isoformat(),
+            })
+            _atomic_write(str(path), existing)
+        except Exception as exc:
+            log.warning("orch.save_suspect_failed", error=str(exc))
+
     @staticmethod
     def _safe_delete(client, fip_id: str) -> None:
         try:
@@ -341,6 +365,55 @@ class Orchestrator:
             except Exception:
                 counts[client.username] = 0
         return counts
+
+    # ------------------------------------------------------------------
+    # Startup cleanup: reclaim whitelisted FIPs, delete the rest
+    # ------------------------------------------------------------------
+
+    def _cleanup_existing_fips(self) -> None:
+        log.info("orch.cleanup_start")
+        reclaimed = 0
+        deleted = 0
+        for client in self._account_pool.clients:
+            try:
+                fips = client.list_floating_ips()
+            except Exception as exc:
+                log.warning("orch.cleanup_list_error",
+                            account=getattr(client, "username", "?"), error=str(exc))
+                continue
+
+            for fip in fips:
+                ip = fip.get("floating_ip_address", "")
+                fip_id = fip.get("id", "")
+                if not ip or not fip_id:
+                    continue
+
+                subnet = ip_to_cidr24(ip)
+                if self.filter.is_ip_in_whitelist(ip):
+                    already = any(t.fip_id == fip_id for t in self._pending_tasks)
+                    if not already:
+                        task = SubnetTask(
+                            cidr=subnet,
+                            fip_id=fip_id,
+                            fip_ip=ip,
+                            account=client.username,
+                            client=client,
+                        )
+                        self._pending_tasks.append(task)
+                        self._log_ip(ip, event="reclaimed", subnet=subnet,
+                                     account=client.username, fip_id=fip_id)
+                        log.info("orch.fip_reclaimed", ip=ip, subnet=subnet,
+                                 account=client.username)
+                        reclaimed += 1
+                else:
+                    self._safe_delete(client, fip_id)
+                    self._log_ip(ip, event="cleanup_deleted", subnet=subnet,
+                                 account=client.username, fip_id=fip_id)
+                    log.info("orch.cleanup_deleted", ip=ip, subnet=subnet,
+                             account=client.username)
+                    deleted += 1
+
+        log.info("orch.cleanup_done", reclaimed=reclaimed, deleted=deleted)
 
     # ------------------------------------------------------------------
     # Shutdown
@@ -441,21 +514,14 @@ class Orchestrator:
                 log.info("orch.task_created", ip=ip, subnet=subnet)
 
     # ------------------------------------------------------------------
-    # Phase 2: verify pending tasks (ICMP + WL)
+    # Phase 2: verify pending tasks — sequential: ICMP first, then WL
     # ------------------------------------------------------------------
 
     def _verify_phase(self) -> None:
         if not self._pending_tasks:
             return
 
-        # WL submit for any task without a job
-        for task in self._pending_tasks:
-            if task.wl_job_id is None:
-                got = self.wl_pool.submit(task.cidr)
-                if got is not None:
-                    task.wl_job_id, task.wl_key = got
-
-        # ICMP probe in parallel
+        # Step 1 — ICMP probe for all unresolved tasks (skip if --no-icmp)
         if not self.no_icmp:
             todo = [t for t in self._pending_tasks if t.icmp_result is None]
             if todo:
@@ -474,16 +540,31 @@ class Orchestrator:
                         log.info("orch.icmp_done",
                                  cidr=task.cidr, alive=alive, total=len(res))
 
-        # WL polling — single pass per outer iteration
+        # Step 2 — Submit WL only for ICMP-alive tasks (WL = final confirmation)
+        # With --no-icmp, submit for all tasks since WL drives the decision.
+        for task in self._pending_tasks:
+            if task.wl_job_id is not None:
+                continue
+            icmp_passed = self.no_icmp or task.icmp_result is True
+            if icmp_passed:
+                got = self.wl_pool.submit(task.cidr)
+                if got is not None:
+                    task.wl_job_id, task.wl_key = got
+
+        # Step 3 — Poll WL results; log outcome to ip_log
         for task in self._pending_tasks:
             if task.wl_job_id and task.wl_key and task.wl_result is None:
                 r = self.wl_pool.get_result(task.wl_job_id, task.wl_key)
                 if r:
                     alive = sum(1 for x in r.get("results", []) if x.get("alive"))
                     task.wl_result = alive > 0
-                    log.info("orch.wl_done", cidr=task.cidr, alive=alive)
+                    event = "wl_confirmed" if task.wl_result else "wl_dead"
+                    self._log_ip(task.fip_ip, event=event, subnet=task.cidr,
+                                 wl_alive=alive, account=task.account)
+                    log.info("orch.wl_done", cidr=task.cidr,
+                             alive=alive, result=task.wl_result)
 
-        # --no-icmp: WL drives the decision
+        # --no-icmp: WL result becomes the ICMP decision
         if self.no_icmp:
             for task in self._pending_tasks:
                 if task.icmp_result is None and task.wl_result is not None:
@@ -491,6 +572,14 @@ class Orchestrator:
 
     # ------------------------------------------------------------------
     # Phase 3: decide
+    #
+    # Cases (with ICMP enabled):
+    #   icmp=True  + wl=True        → WINNER (confirmed from both sides)
+    #   icmp=True  + wl=False       → SUSPECT: ICMP alive, Megafon can't reach.
+    #                                  Keep FIP, notify user, save suspects.json.
+    #   icmp=True  + wl=None        → waiting for WL result (or WL fallback if old)
+    #   icmp=False + wl=*           → DEAD: delete
+    #   icmp=None                   → ICMP still in progress
     # ------------------------------------------------------------------
 
     def _decision_phase(self) -> SubnetTask | None:
@@ -499,22 +588,66 @@ class Orchestrator:
 
         for task in self._pending_tasks:
             if task.icmp_result is None:
-                continue  # still being checked
+                continue  # ICMP still running
 
-            if task.icmp_result:
+            if not task.icmp_result:
+                # ICMP dead — delete regardless of WL (WL was never submitted anyway)
+                self._safe_delete(task.client, task.fip_id)
+                self._log_ip(task.fip_ip, event="deleted", subnet=task.cidr,
+                             reason="icmp_dead", account=task.account)
+                self.stats["dead"] += 1
+                to_remove.append(task)
+                continue
+
+            # icmp_result = True from here
+            if task.wl_result is None:
+                # WL job submitted but not finished yet — keep waiting.
+                # Fallback: if task was never submitted to WL (no keys available)
+                # and has been alive for >120s, accept on ICMP alone.
+                if task.wl_job_id is None:
+                    age = time.time() - task.created_at
+                    if age > 120:
+                        log.info("orch.success_icmp_fallback",
+                                 ip=task.fip_ip, cidr=task.cidr,
+                                 account=task.account, age=round(age))
+                        self._log_ip(task.fip_ip, event="kept", subnet=task.cidr,
+                                     account=task.account, wl_result=None,
+                                     note="wl_unavailable_fallback")
+                        self.stats["white_found"] += 1
+                        winner = task
+                        break
+                continue  # still waiting for WL
+
+            if task.wl_result:
+                # ICMP alive + WL confirmed → full winner
                 log.info("orch.success",
                          ip=task.fip_ip, cidr=task.cidr,
-                         account=task.account, wl_confirmed=task.wl_result)
+                         account=task.account, wl_confirmed=True)
                 self._log_ip(task.fip_ip, event="kept", subnet=task.cidr,
-                             account=task.account, wl_result=task.wl_result)
+                             account=task.account, wl_result=True)
                 self.stats["white_found"] += 1
                 winner = task
                 break
 
-            self._safe_delete(task.client, task.fip_id)
-            self._log_ip(task.fip_ip, event="deleted", subnet=task.cidr,
-                         reason="icmp_dead", account=task.account)
-            self.stats["dead"] += 1
+            # icmp=True but wl=False → SUSPECT (ICMP alive, Megafon can't reach)
+            log.info("orch.suspect",
+                     ip=task.fip_ip, cidr=task.cidr, account=task.account,
+                     fip_id=task.fip_id)
+            self._log_ip(task.fip_ip, event="suspect", subnet=task.cidr,
+                         account=task.account, reason="icmp_alive_wl_dead",
+                         fip_id=task.fip_id)
+            self.stats["suspects"] += 1
+            self._save_suspect_ip(task, reason="icmp_alive_wl_dead")
+            try:
+                self.notifier.notify_suspect(
+                    ip=task.fip_ip,
+                    subnet=task.cidr,
+                    account=task.account,
+                    fip_id=task.fip_id,
+                )
+            except Exception:
+                pass
+            # DO NOT delete FIP — user must manually verify and delete
             to_remove.append(task)
 
         for t in to_remove:
@@ -545,6 +678,8 @@ class Orchestrator:
                  dry_run=self.dry_run, no_icmp=self.no_icmp,
                  accounts=len(self._account_pool.clients),
                  wl_keys=len(self.wl_pool.keys))
+
+        self._cleanup_existing_fips()
 
         try:
             while self._running:

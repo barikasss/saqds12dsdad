@@ -74,7 +74,7 @@ def test_wl_key_pool_round_robin():
 
 
 # ---------------------------------------------------------------------------
-# 2. SubnetTask flow: ICMP True → success
+# 2. SubnetTask flow: ICMP True + WL True → confirmed winner
 # ---------------------------------------------------------------------------
 
 def test_subnet_task_flow(write_config):
@@ -87,6 +87,7 @@ def test_subnet_task_flow(write_config):
         account="dry-A",
         client=orch._account_pool.clients[0],
         icmp_result=True,
+        wl_result=True,
     )
     orch._pending_tasks.append(task)
 
@@ -94,6 +95,54 @@ def test_subnet_task_flow(write_config):
 
     assert winner is task
     assert orch.stats["white_found"] == 1
+
+
+def test_subnet_task_icmp_fallback(write_config):
+    """ICMP alive but WL unavailable (no keys) >120s → winner by fallback."""
+    import time
+    orch = Orchestrator(config_path=write_config, dry_run=True)
+
+    task = SubnetTask(
+        cidr="10.0.0.0/24",
+        fip_id="dry-1",
+        fip_ip="10.0.0.5",
+        account="dry-A",
+        client=orch._account_pool.clients[0],
+        icmp_result=True,
+        wl_job_id=None,
+        wl_result=None,
+    )
+    task.created_at = time.time() - 200  # simulate 200s old task
+    orch._pending_tasks.append(task)
+
+    winner = orch._decision_phase()
+
+    assert winner is task
+    assert orch.stats["white_found"] == 1
+
+
+def test_subnet_task_suspect(write_config):
+    """ICMP alive but WL dead → suspect: FIP kept, stats updated, no deletion."""
+    orch = Orchestrator(config_path=write_config, dry_run=True)
+    client = orch._account_pool.clients[0]
+
+    task = SubnetTask(
+        cidr="10.0.0.0/24",
+        fip_id="dry-1",
+        fip_ip="10.0.0.5",
+        account="dry-A",
+        client=client,
+        icmp_result=True,
+        wl_result=False,
+    )
+    orch._pending_tasks.append(task)
+
+    winner = orch._decision_phase()
+
+    assert winner is None
+    assert orch.stats["suspects"] == 1
+    assert orch.stats["dead"] == 0
+    assert task not in orch._pending_tasks
 
 
 # ---------------------------------------------------------------------------

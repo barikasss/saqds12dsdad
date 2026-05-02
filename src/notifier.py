@@ -131,6 +131,23 @@ class TelegramNotifier:
         )
         return self.notify(text)
 
+    def notify_suspect(
+        self,
+        ip: str,
+        subnet: str,
+        account: str,
+        fip_id: str,
+    ) -> bool:
+        e = html.escape
+        text = (
+            f"⚠️ Под вопросом!\n"
+            f"IP: <code>{e(ip)}</code> | Подсеть: <code>{e(subnet)}</code>\n"
+            f"ICMP жив, но WL (Мегафон) не подтвердил.\n"
+            f"Аккаунт: {e(account)} | FIP: <code>{e(fip_id)}</code>\n"
+            f"Проверь вручную и удали FIP если не нужен."
+        )
+        return self.notify(text)
+
     def notify_warning(
         self,
         message: str,
