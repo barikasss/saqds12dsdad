@@ -47,7 +47,11 @@ The main loop is `src/orchestrator.py:Orchestrator.run`, which runs three phases
 
 2. **`_verify_phase`** — for all pending tasks, concurrently: submit to `WLKeyPool` (if no job yet), ICMP-probe the `/24` via `ICMPChecker` (parallel threads), and poll WL job results. `--no-icmp` makes WL results drive the ICMP field instead.
 
-3. **`_decision_phase`** — tasks with a resolved `icmp_result` are either kept (→ winner, `stats["white_found"]`) or deleted (→ `stats["dead"]`). The first winner exits the process via `sys.exit(0)`.
+3. **`_decision_phase`** — tasks with a resolved `icmp_result` are evaluated:
+   - `icmp=True + wl=True` → **winner** (`stats["white_found"]`), notify Telegram, `sys.exit(0)`
+   - `icmp=True + wl=False` → **suspect** (`stats["suspects"]`), saved to `data/suspects.json`, Telegram `notify_suspect`, FIP is NOT deleted (user must verify manually)
+   - `icmp=True + wl=None, age > 120s` → accept on ICMP alone (WL key unavailable fallback)
+   - `icmp=False` → **dead** (`stats["dead"]`), FIP deleted
 
 **Key collaborators:**
 
@@ -59,15 +63,27 @@ The main loop is `src/orchestrator.py:Orchestrator.run`, which runs three phases
 - `SubnetFilter` (`src/subnet_filter.py`) — two-level O(1) index: a `set` of `/24` strings + wider networks for prefixes shorter than `/24`.
 - `TelegramNotifier` (`src/notifier.py`) — HTML `sendMessage`, local rate limit 3s. `notify_progress` fires every 600s of wall-clock time (tracked by `_last_progress_notify`); `notify_white_found` fires on each winner.
 
-**Stats tracked in `self.stats`:** `checked`, `white_found`, `dead`, `deleted_not_in_whitelist`, `total_created`. `_current_stats()` adds `elapsed`, `pending`, and `account_counts` (per-account live FIP count from `_get_account_fips_counts()`).
+**Stats tracked in `self.stats`:** `checked`, `white_found`, `dead`, `deleted_not_in_whitelist`, `total_created`, `suspects`. `_current_stats()` adds `elapsed`, `pending`, and `account_counts` (per-account live FIP count from `_get_account_fips_counts()`).
 
-**Side-effect files** (under `data/`, gitignored except `.gitkeep`): `run_YYYYMMDD_HHMMSS.log`, `checked_state.json`, `subnets_cache.json`, `found_ips.json`, `ip_log.jsonl`.
+**Side-effect files** (under `data/`, gitignored except `.gitkeep`): `run_YYYYMMDD_HHMMSS.log`, `checked_state.json`, `subnets_cache.json`, `found_ips.json`, `suspects.json`, `ip_log.jsonl`.
 
 ## External constraints
 
 - WLChecker per-key cooldown is 300s, enforced in `WLKeyPool._last_used`. Adding more keys to `WL_API_KEYS` increases throughput.
 - Selectel requires a **service user** (`member` role on the project) — ordinary account creds won't authenticate via Keystone password-method.
 - ICMP requires raw sockets; pass `--no-icmp` in WSL and Termux.
+
+## Branches
+
+- `beta` — current working branch (this codebase)
+- `split` — in development; see `PLAN.md` for 9-step implementation plan. Adds: ProxyPool (18 SOCKS5 proxies), dead subnet cache, parallel ICMP+WL, OR logic, never-stop mode, FastAPI job server on VM, `ping_agent.py` for Samsung
+
+## WSL-specific notes
+
+Git pushes to GitHub require routing through the Windows host proxy:
+```bash
+git -c http.proxy=socks5h://172.31.240.1:10808 push origin <branch>
+```
 
 ## Testing notes
 
