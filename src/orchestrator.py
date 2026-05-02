@@ -24,7 +24,7 @@ from src.checkers.icmp_checker import ICMPChecker
 from src.checkers.wl_pool import WLKeyPool
 from src.config import load_config
 from src.notifier import TelegramNotifier
-from src.selectel_api import SelectelClient, SelectelRateLimitError
+from src.selectel_api import SelectelAPIError, SelectelClient, SelectelRateLimitError
 from src.subnet_filter import SubnetFilter
 from src.subnet_source import SubnetSource, _atomic_write
 
@@ -379,14 +379,16 @@ class Orchestrator:
         deleted = 0
         for client in self._account_pool.clients:
             try:
-                fips = client.list_floating_ips()
+                fips = client.list_floating_ips(max_conn_retries=1)
             except Exception as exc:
                 log.warning("orch.cleanup_list_error",
                             account=getattr(client, "username", "?"), error=str(exc))
-                self._account_pool.mark_rate_limited(
-                    client,
-                    datetime.now(timezone.utc) + timedelta(seconds=120),
-                )
+                # Connection/timeout errors (status=0) are not rate-limits — skip block
+                if not (isinstance(exc, SelectelAPIError) and exc.status == 0):
+                    self._account_pool.mark_rate_limited(
+                        client,
+                        datetime.now(timezone.utc) + timedelta(seconds=120),
+                    )
                 continue
 
             for fip in fips:
@@ -466,11 +468,12 @@ class Orchestrator:
             except Exception as exc:
                 log.warning("orch.list_fips_error",
                             account=getattr(client, "username", "?"), error=str(exc))
-                # Auth/network failure → block account briefly so we don't hammer it
-                self._account_pool.mark_rate_limited(
-                    client,
-                    datetime.now(timezone.utc) + timedelta(seconds=60),
-                )
+                # Connection/timeout errors (status=0) are not rate-limits — skip block
+                if not (isinstance(exc, SelectelAPIError) and exc.status == 0):
+                    self._account_pool.mark_rate_limited(
+                        client,
+                        datetime.now(timezone.utc) + timedelta(seconds=60),
+                    )
                 continue
 
             while fips_count < MAX_FIPS_PER_ACCOUNT and self._running:

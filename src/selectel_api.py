@@ -47,10 +47,11 @@ class SelectelClient:
         username: str = "",
         password: str = "",
         proxy_url: str | None = None,
-        request_timeout: int = 20,
+        request_timeout: int = 60,
     ) -> None:
         self._api_token = api_token
         self._region = region
+        self._fallback_region: str | None = "ru-2" if region == "ru-3" else None
         self._project_id = project_id
         self._account_id = account_id
         self.username = username          # public for AccountPool logging
@@ -170,27 +171,50 @@ class SelectelClient:
     def _request_with_retry(
         self, method: str, url: str,
         raise_on_rate_limit: bool = False,
+        max_conn_retries: int = 3,
         **kwargs,
     ) -> requests.Response:
         """Raw HTTP request with backoff retry on 429 and 5xx.
 
         If raise_on_rate_limit=True, HTTP 429 raises SelectelRateLimitError
         instead of sleeping — used by create_floating_ip_safe for AccountPool.
+        max_conn_retries: how many connection/timeout errors to tolerate (default 3).
         """
         delays = [2, 4, 8]
         server_errors = 0
         conn_errors = 0
-        max_retries = 3
+        max_retries = max_conn_retries
+        _url = url
+        _tried_fallback = False
 
         while True:
             try:
                 resp = self._session.request(
-                    method, url,
+                    method, _url,
                     proxies=self._proxies,
                     timeout=self._request_timeout,
                     **kwargs,
                 )
-            except (requests.ConnectionError, requests.Timeout) as exc:
+            except requests.Timeout as exc:
+                if self._fallback_region and not _tried_fallback:
+                    _tried_fallback = True
+                    _url = url.replace(
+                        f"https://{self._region}.",
+                        f"https://{self._fallback_region}.",
+                    )
+                    log.warning("selectel.timeout_fallback",
+                                from_region=self._region,
+                                to_region=self._fallback_region)
+                    continue
+                conn_errors += 1
+                if conn_errors > max_retries:
+                    raise SelectelAPIError(
+                        0, f"Timeout after {max_retries} retries: {exc}"
+                    ) from exc
+                log.warning("selectel.connection_retry", attempt=conn_errors)
+                time.sleep(delays[conn_errors - 1])
+                continue
+            except requests.ConnectionError as exc:
                 conn_errors += 1
                 if conn_errors > max_retries:
                     raise SelectelAPIError(
@@ -229,6 +253,7 @@ class SelectelClient:
         """Authenticated request. Retries auth once on 401."""
         caller_headers: dict[str, str] = kwargs.pop("headers", {})
         raise_on_rate_limit: bool = kwargs.pop("raise_on_rate_limit", False)
+        max_conn_retries: int = kwargs.pop("max_conn_retries", 3)
         for auth_attempt in range(2):
             merged = {"X-Auth-Token": self._auth(), **caller_headers}
             if self._project_id:
@@ -237,6 +262,7 @@ class SelectelClient:
                 return self._request_with_retry(
                     method, url,
                     raise_on_rate_limit=raise_on_rate_limit,
+                    max_conn_retries=max_conn_retries,
                     headers=merged,
                     **kwargs,
                 )
@@ -253,9 +279,10 @@ class SelectelClient:
     # Public API
     # ------------------------------------------------------------------
 
-    def list_floating_ips(self) -> list[dict]:
+    def list_floating_ips(self, max_conn_retries: int = 3) -> list[dict]:
         """[{id, floating_ip_address, status, port_id, ...}]"""
-        resp = self._request("GET", f"{self._net_base}/floatingips")
+        resp = self._request("GET", f"{self._net_base}/floatingips",
+                             max_conn_retries=max_conn_retries)
         return resp.json().get("floatingips", [])
 
     def list_external_networks(self) -> list[dict]:
