@@ -19,10 +19,12 @@ class ICMPChecker:
         timeout: float = 1.0,
         count: int = 1,
         concurrency: int = 32,
+        interface: str | None = None,
     ) -> None:
         self.timeout = timeout
         self.count = count
         self.concurrency = concurrency
+        self.interface = interface
 
     def _ping_bin(self) -> str:
         found = shutil.which("ping")
@@ -46,7 +48,10 @@ class ICMPChecker:
             # busybox ping needs an integer; modern iputils accepts floats.
             # Use int with min=1 so we never pass "-W 0".
             timeout_arg = str(max(1, int(self.timeout)))
-            cmd = [ping_bin, "-c", str(self.count), "-W", timeout_arg, ip]
+            cmd = [ping_bin, "-c", str(self.count), "-W", timeout_arg]
+            if self.interface:
+                cmd += ["-I", self.interface]
+            cmd.append(ip)
 
         try:
             proc = subprocess.run(

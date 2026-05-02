@@ -262,6 +262,7 @@ class Orchestrator:
         self.icmp = ICMPChecker(
             timeout=ic.get("timeout", 1.0),
             concurrency=ic.get("concurrency", 32),
+            interface=ic.get("interface") or None,
         )
 
         wc = c.get("wlchecker", {})

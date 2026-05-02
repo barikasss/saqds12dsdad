@@ -24,6 +24,7 @@ checkers:
   icmp:
     timeout: 1.0
     concurrency: 32
+    interface: rmnet0  # Мегафон SIM напрямую, минуя VPN (tun1)
   tcp:
     ports: [22, 80, 443]
     timeout: 2.0
