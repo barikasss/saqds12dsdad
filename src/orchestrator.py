@@ -459,6 +459,11 @@ class Orchestrator:
             except Exception as exc:
                 log.warning("orch.list_fips_error",
                             account=getattr(client, "username", "?"), error=str(exc))
+                # Auth/network failure → block account briefly so we don't hammer it
+                self._account_pool.mark_rate_limited(
+                    client,
+                    datetime.now(timezone.utc) + timedelta(seconds=60),
+                )
                 continue
 
             while fips_count < MAX_FIPS_PER_ACCOUNT and self._running:
