@@ -490,8 +490,14 @@ class Orchestrator:
                     )
                     break
                 except Exception as exc:
+                    err_str = str(exc)
                     log.warning("orch.fip_create_error",
-                                account=client.username, error=str(exc))
+                                account=client.username, error=err_str)
+                    if "ExternalIpAddressExhausted" in err_str:
+                        self._account_pool.mark_rate_limited(
+                            client,
+                            datetime.now(timezone.utc) + timedelta(seconds=30),
+                        )
                     break
 
                 fips_count += 1  # counts toward MAX even if we delete below

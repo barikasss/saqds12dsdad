@@ -192,7 +192,7 @@ class SelectelClient:
                 resp = self._session.request(
                     method, _url,
                     proxies=self._proxies,
-                    timeout=self._request_timeout,
+                    timeout=(10, self._request_timeout),
                     **kwargs,
                 )
             except requests.Timeout as exc:
