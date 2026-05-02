@@ -1,173 +1,134 @@
 # White IP Hunter
-Поиск IP-подсетей Selectel, доступных с мобильного интернета РФ (Megafon).
+Поиск Selectel floating IP, чья /24 подсеть доступна с мобильного интернета РФ (Megafon).
 
 ---
 
-## Быстрый старт
+## Ветки
 
+| Ветка | Статус | Описание |
+|---|---|---|
+| `beta` | ✅ Работает | Samsung + 2 Selectel аккаунта, ICMP с Мегафона, WLChecker |
+| `split` | 🚧 В разработке | VM-оркестратор + Samsung пинг-агент + пул из 18 прокси |
+
+---
+
+## beta — текущая реализация
+
+**Стек:** Samsung Note 9 (Termux, root) + Megafon SIM + happ VPN (SOCKS5 127.0.0.1:10808)
+
+**Логика:**
+1. Создать FIP на Selectel (2 аккаунта, макс 12 на каждый)
+2. Проверить /24 по `data/white_subnets.txt` (46k подсетей) — не в списке → удалить сразу
+3. ICMP пинг всей /24 с Мегафона напрямую через `rmnet0` (минуя VPN)
+4. WLChecker API (9 ключей, параллельно по одному на задачу)
+5. ICMP alive > 0 **И** WL подтвердил → SUCCESS → Telegram → стоп
+
+**Быстрый старт:**
 ```bash
-# 1. Заполни переменные окружения
-cp .env.example .env
-# → отредактируй .env (вставь ключи, см. таблицу ниже)
-
-# 2. Скопируй конфиг
+cp .env.example .env          # вставь ключи
 cp config.example.yaml config.yaml
-
-# 3. Установи зависимости (внутри venv)
 python3 -m venv .venv && source .venv/bin/activate
 pip install -r requirements.txt
-
-# 4. Проверь что всё в порядке
-pytest                             # должно быть 47 зелёных
-
-# 5. Тест без денег (dry-run, не трогает Selectel)
-python -m src.orchestrator --dry-run --phase 1
-
-# 6. Реальный запуск (Phase 1 — приоритетные подсети)
-python -m src.orchestrator --phase 1
+python -m src.orchestrator --no-icmp   # без ICMP (WSL/без рута)
+sudo python -m src.orchestrator        # с ICMP пингами (нужен root)
 ```
 
----
-
-## Переменные окружения
+**Переменные окружения (.env):**
 
 | Переменная | Описание |
 |---|---|
-| `SELECTEL_ACCOUNT_ID` | 6-значный номер аккаунта Selectel |
-| `SELECTEL_USERNAME` | Логин сервисного пользователя |
-| `SELECTEL_PASSWORD` | Пароль сервисного пользователя |
-| `SELECTEL_PROJECT_ID` | UUID проекта в Selectel Cloud |
-| `WLCHECKER_API_KEY` | Ключ от WLChecker API |
-| `TG_BOT_TOKEN` | Токен Telegram-бота для уведомлений |
-| `TG_CHAT_ID` | Числовой Telegram ID (узнать у @userinfobot) |
+| `SELECTEL_PASSWORD_1` / `_2` | Пароли двух Selectel аккаунтов |
+| `WL_API_KEYS` | Ключи WLChecker через запятую |
+| `TG_BOT_TOKEN` / `TG_CHAT_ID` | Telegram бот |
+| `TG_PROXY_URL` | `socks5://127.0.0.1:10808` (happ VPN на Android) |
 
-Сервисного пользователя создавай в ЛК Selectel → **Управление** → **Пользователи** →
-**Создать сервисного пользователя** с ролью `member` на нужный проект.
-
----
-
-## Запуск
-
-```bash
-source .venv/bin/activate
-
-# Dry-run: WLChecker работает, Selectel create/delete не вызывается
-python -m src.orchestrator --dry-run --phase 1
-
-# Phase 1 — только приоритетные подсети из config.yaml
-python -m src.orchestrator --phase 1
-
-# Phase 1 без ICMP (быстрее, не нужен root в Termux)
-python -m src.orchestrator --phase 1 --no-icmp
-
-# Phase 2 — широкий поиск по всем подсетям AS49505 (~1700 /24)
-python -m src.orchestrator --phase 2 --no-icmp
-
-# Полный прогон Phase 1 → Phase 2
-python -m src.orchestrator
-
-# Продолжить прерванный прогон
-python -m src.orchestrator --resume --phase 2
-
-# Статистика пула подсетей
-python -m src.subnet_source --stats
-
-# Принудительное обновление данных RIPE
-python -m src.subnet_source --refresh
-
-# Тест Telegram-уведомлений
-python -m src.notifier --test "Hello from white-ip-hunter"
+**config.yaml — важные параметры:**
+```yaml
+checkers:
+  icmp:
+    interface: rmnet0   # Мегафон SIM напрямую, минуя VPN
+    concurrency: 32
+selectel_accounts:
+  - account_id: "577991"
+    username: "Priya"
+    password_env: SELECTEL_PASSWORD_1
+    project_id: "..."
+    availability_zone: ru-2
+    enabled: true
 ```
 
-### Флаги CLI
+**Флаги:**
 
 | Флаг | Описание |
 |---|---|
-| `--dry-run` | Не вызывать Selectel create/delete |
-| `--resume` | Не сбрасывать state, продолжить с прерванного места |
-| `--phase {1,2,both}` | 1=только priority, 2=широкий, both=всё |
-| `--no-icmp` | Пропустить локальный ICMP, сразу WLChecker |
-| `--config PATH` | Путь к config.yaml (default: config.yaml) |
+| `--no-icmp` | WLChecker как единственный оракул (без ICMP) |
+| `--dry-run` | Без реальных вызовов Selectel |
+| `--config PATH` | Путь к config.yaml |
+
+**Известные особенности:**
+- ICMP нужен root + `interface: rmnet0` в конфиге — иначе пинги идут через VPN и дают ложные 254/254
+- `ExternalIpAddressExhausted` от Selectel — временно, оркестратор ждёт 30 сек и повторяет
+- Таймаут Selectel API: 10с connect / 60с read; при таймауте на ru-3 автофоллбэк на ru-2
 
 ---
 
-## Поток работы
+## split — новая архитектура (в разработке)
+
+**Идея:** разделить оркестратор (VM) и пингер (Samsung), убрать зависимость от одного IP для Selectel.
+
+**Стек:**
+- **VM (VPS):** оркестратор + FastAPI job queue + пул из 18 SOCKS5 прокси
+- **Samsung (Termux):** лёгкий `ping_agent.py`, polling VM каждые 2 сек
 
 ```
-config.yaml + .env
-        │
-        ▼
-┌─────────────────────────────┐
-│  Phase 1 — Quick Win        │
-│  WLChecker.check_batch(     │
-│    priority_subnets)        │
-│  any alive? → success_flow  │
-└──────────────┬──────────────┘
-               │ нет белых
-               ▼
-┌─────────────────────────────┐
-│  Phase 2 — Wide Search      │
-│  RIPE AS49505 → ~1700 /24s  │
-│  for cidr in unchecked:     │
-│    ICMP pre-screen (опц.)   │
-│    WLChecker.check_subnet   │
-│    ≥5% alive → success_flow │
-└──────────────┬──────────────┘
-               │ найдено
-               ▼
-┌─────────────────────────────┐
-│  success_flow               │
-│  Selectel.reroll(cidr, 15)  │
-│  FIP выпал в CIDR?          │
-│    да → notify_success      │
-│         data/found_ips.json │
-│         exit(0)             │
-│    нет → notify_warning     │
-│          exit(1)            │
-└─────────────────────────────┘
+VM (VPS)                              Samsung (Termux)
+├── orchestrator (без ICMP)           └── ping_agent.py
+├── Selectel API → proxy_pool              ├── GET /ping-jobs
+│   └── round-robin, 18 прокси            ├── ping /24 → rmnet0
+├── WLChecker (9 ключей)                  └── POST /ping-results
+├── FastAPI: /ping-jobs, /ping-results
+├── Dead subnet кэш (data/dead_subnets.txt)
+└── Telegram
 ```
 
-Лог каждого запуска: `data/run_YYYYMMDD_HHMMSS.log`  
-Состояние пула: `data/checked_state.json`  
-Найденные IP: `data/found_ips.json`
+**Ключевые отличия от beta:**
 
----
+| | beta | split |
+|---|---|---|
+| Прокси Selectel | один (happ) | 18 SOCKS5, round-robin + кулдаун |
+| ICMP + WL | последовательно | параллельно |
+| Логика победы | ICMP **AND** WL | ICMP **OR** WL |
+| При нахождении | стоп | продолжает, копит IP |
+| Мёртвые подсети | не кэшируются | пропускаются сразу |
+| ICMP | на том же устройстве | Samsung агент через HTTP polling |
 
-## Setup (Termux на Samsung)
-
-```bash
-bash setup_termux.sh
+**Новые компоненты:**
 ```
-
-Подробнее — в самом скрипте.
+src/proxy_pool.py   — пул прокси (аналог WLKeyPool, round-robin + кулдаун)
+src/job_server.py   — FastAPI сервер задач на VM
+ping_agent.py       — Samsung агент (~60 строк)
+```
 
 ---
 
 ## Troubleshooting
 
-**`SelectelAPIError 401` — Password auth failed**  
-→ Проверь `SELECTEL_ACCOUNT_ID` / `SELECTEL_USERNAME` / `SELECTEL_PASSWORD` / `SELECTEL_PROJECT_ID` в `.env`.  
-→ Сервисный пользователь создаётся в ЛК Selectel → Управление → Пользователи.  
-→ `SELECTEL_PROJECT_ID` — UUID из URL облачного проекта.
+**`SelectelAPIError 401`**
+→ Проверь `account_id` / `username` / `password` / `project_id` в config.yaml и .env.
+→ Сервисный пользователь: ЛК Selectel → Управление → Пользователи → роль `member`.
 
-**`WLError: Connection failed after retries`**  
-→ Проверь доступность `http://150.241.74.147:8082`.  
-→ WLChecker cooldown 5 минут между submit — это нормально, жди.
+**`ExternalIpAddressExhausted`**
+→ Selectel временно исчерпал пул IP в регионе. Нормально, оркестратор сам повторит через 30с.
 
-**`WLChecker cooldown 300s` в логе**  
-→ Предыдущий submit был меньше 5 минут назад. Подожди или убедись что `.wl_cooldown` актуален.
+**ICMP всегда 254/254 alive**
+→ Пинги идут через VPN. Добавь `interface: rmnet0` в `config.yaml` под `checkers.icmp`.
 
-**Telegram не отправляет**  
-→ Проверь `TG_BOT_TOKEN` и `TG_CHAT_ID` в `.env`.  
-→ Запусти `python -m src.notifier --test "ping"`.  
-→ Если бот молчит — напиши ему `/start` в чате.
+**Telegram не отправляет**
+→ Проверь `TG_PROXY_URL` в `.env` — на Android должно быть `socks5://127.0.0.1:10808`.
+→ `python -m src.notifier --test "ping"`
 
-**ICMP не работает в WSL**  
-→ Добавь `--no-icmp` к команде запуска.
+**`ping: operation not permitted`**
+→ Нужен root: `sudo python -m src.orchestrator`
 
-**На Termux: `ping: operation not permitted`**  
-→ `pkg install iputils` — если не помогает, используй `--no-icmp`.  
-→ С root: `su -c "python -m src.orchestrator --phase 2"`.
-
-**`pytest` падает с ImportError**  
-→ Активируй venv: `source .venv/bin/activate`.
+**pytest падает с ImportError**
+→ `source .venv/bin/activate`
