@@ -532,13 +532,14 @@ class Orchestrator:
         if self._pending_tasks:
             time.sleep(2)
 
-        try:
-            log.info("orch.notify_attempt", type="warning")
-            self.notifier.notify_warning(
+        # Non-blocking Telegram notify (daemon thread — won't delay exit)
+        threading.Thread(
+            target=lambda: self.notifier.notify_warning(
                 "Остановлено пользователем", context={"signal": int(signum)}
-            )
-        except Exception:
-            pass
+            ),
+            daemon=True,
+        ).start()
+
         sys.exit(130)
 
     # ------------------------------------------------------------------
@@ -631,10 +632,15 @@ class Orchestrator:
                              account=client.username)
                 log.info("orch.task_created", ip=ip, subnet=subnet)
 
-                # Submit to WL immediately — runs in parallel with ICMP
-                got = self.wl_pool.submit(task.cidr)
-                if got is not None:
-                    task.wl_job_id, task.wl_key = got
+                # Submit to WL immediately — skip if same CIDR already submitted
+                already_submitted = any(
+                    t.wl_job_id is not None and t.cidr == task.cidr
+                    for t in self._pending_tasks
+                )
+                if not already_submitted:
+                    got = self.wl_pool.submit(task.cidr)
+                    if got is not None:
+                        task.wl_job_id, task.wl_key = got
 
     # ------------------------------------------------------------------
     # Phase 2: verify — ICMP and WL run in parallel
@@ -646,16 +652,24 @@ class Orchestrator:
 
         # Step 1 — ICMP probe (remote via Samsung agent OR local)
         if self._ping_client is not None and not self.no_icmp:
-            # Remote ICMP: enqueue new tasks, poll results
+            # Remote ICMP: enqueue — one request per unique CIDR
+            enqueued_cidrs = {t.cidr for t in self._pending_tasks if t.icmp_enqueued}
             for task in self._pending_tasks:
                 if task.icmp_result is None and not task.icmp_enqueued:
-                    if self._ping_client.enqueue(task.cidr):
+                    if task.cidr not in enqueued_cidrs:
+                        if self._ping_client.enqueue(task.cidr):
+                            enqueued_cidrs.add(task.cidr)
+                            log.info("orch.remote_icmp_enqueued", cidr=task.cidr)
+                    if task.cidr in enqueued_cidrs:
                         task.icmp_enqueued = True
-                        log.info("orch.remote_icmp_enqueued", cidr=task.cidr)
 
+            # Poll results — propagate to all tasks with same CIDR
+            checked: dict[str, int | None] = {}
             for task in self._pending_tasks:
                 if task.icmp_result is None and task.icmp_enqueued:
-                    result = self._ping_client.get_result(task.cidr)
+                    if task.cidr not in checked:
+                        checked[task.cidr] = self._ping_client.get_result(task.cidr)
+                    result = checked[task.cidr]
                     if result is not None:
                         task.icmp_result = result > 0
                         log.info("orch.remote_icmp_done",
