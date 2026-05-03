@@ -329,6 +329,7 @@ class Orchestrator:
             cooldown_seconds=wc.get("submit_cooldown_seconds", 300),
             proxy_url=wc.get("proxy_url"),
         )
+        self._wl_min_alive: int = wc.get("min_alive", 5)
 
         self.source = SubnetSource(priority_subnets=priority)
         self.filter = SubnetFilter.from_file(
@@ -710,7 +711,7 @@ class Orchestrator:
                 r = self.wl_pool.get_result(task.wl_job_id, task.wl_key)
                 if r:
                     alive = sum(1 for x in r.get("results", []) if x.get("alive"))
-                    task.wl_result = alive > 0
+                    task.wl_result = alive >= self._wl_min_alive
                     event = "wl_confirmed" if task.wl_result else "wl_dead"
                     self._log_ip(task.fip_ip, event=event, subnet=task.cidr,
                                  wl_alive=alive, account=task.account)
