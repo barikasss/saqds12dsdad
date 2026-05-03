@@ -14,7 +14,7 @@
 | 3 | `src/orchestrator.py` — dead subnet кэш | ✅ готово |
 | 4 | `src/orchestrator.py` — ICMP + WL параллельно | ✅ готово |
 | 5 | `src/orchestrator.py` — OR логика + не останавливаться | ✅ готово |
-| 6 | `src/job_server.py` — FastAPI на VM | ⬜ не начато |
+| 6 | `src/job_server.py` — FastAPI на VM | ✅ готово |
 | 7 | `ping_agent.py` — Samsung агент | ⬜ не начато |
 | 8 | `src/orchestrator.py` — интеграция с job server | ⬜ не начато |
 | 9 | Тесты + проверка на тестовом сервере | ⬜ не начато |
