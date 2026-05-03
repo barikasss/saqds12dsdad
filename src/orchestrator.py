@@ -135,7 +135,7 @@ class _DryRunClient:
         self._allocated: dict[str, dict] = {}
         self._counter = 0
 
-    def list_floating_ips(self) -> list[dict]:
+    def list_floating_ips(self, max_conn_retries: int = 3) -> list[dict]:
         return list(self._allocated.values())
 
     def list_external_networks(self) -> list[dict]:
