@@ -3,10 +3,15 @@ __pycache__/
 .venv/
 venv/
 .env
+.env-*
 config.yaml
+conf-for-*.yaml
 data/*.json
 data/*.log
 data/run_*.log
+data/dead_subnets.txt
 .pytest_cache/
 .wl_cooldown
 *.egg-info/
+VM-config.yaml
+.env-from-sums
