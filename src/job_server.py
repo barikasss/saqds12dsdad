@@ -12,7 +12,10 @@ from __future__ import annotations
 
 import os
 import threading
-from typing import Annotated
+try:
+    from typing import Annotated
+except ImportError:
+    from typing_extensions import Annotated
 
 import structlog
 from fastapi import Depends, FastAPI, HTTPException, Header
