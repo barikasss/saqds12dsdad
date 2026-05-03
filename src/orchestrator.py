@@ -273,7 +273,8 @@ class Orchestrator:
 
         # Shared proxy pool for create_floating_ip_safe (split branch)
         proxies_env = os.environ.get("SELECTEL_PROXIES", "").strip()
-        proxy_pool = ProxyPool.from_env(proxies_env) if proxies_env else None
+        proxy_cooldown = int(os.environ.get("SELECTEL_PROXY_COOLDOWN", "0"))
+        proxy_pool = ProxyPool.from_env(proxies_env, cooldown_seconds=proxy_cooldown) if proxies_env else None
         if proxy_pool:
             log.info("orch.proxy_pool_loaded", count=len(proxy_pool.proxies))
 
