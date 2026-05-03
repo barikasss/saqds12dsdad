@@ -10,7 +10,7 @@
 | # | Компонент | Статус |
 |---|---|---|
 | 1 | `src/proxy_pool.py` | ✅ готово |
-| 2 | `src/selectel_api.py` — поддержка ProxyPool | ⬜ не начато |
+| 2 | `src/selectel_api.py` — поддержка ProxyPool | ✅ готово |
 | 3 | `src/orchestrator.py` — dead subnet кэш | ⬜ не начато |
 | 4 | `src/orchestrator.py` — ICMP + WL параллельно | ⬜ не начато |
 | 5 | `src/orchestrator.py` — OR логика + не останавливаться | ⬜ не начато |

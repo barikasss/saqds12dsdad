@@ -24,6 +24,7 @@ from src.checkers.icmp_checker import ICMPChecker
 from src.checkers.wl_pool import WLKeyPool
 from src.config import load_config
 from src.notifier import TelegramNotifier
+from src.proxy_pool import ProxyPool
 from src.selectel_api import SelectelAPIError, SelectelClient, SelectelRateLimitError
 from src.subnet_filter import SubnetFilter
 from src.subnet_source import SubnetSource, _atomic_write
@@ -225,6 +226,12 @@ class Orchestrator:
         sr = cfg.get("search", {})
         priority: list[str] = sr.get("priority_subnets", [])
 
+        # Shared proxy pool for create_floating_ip_safe (split branch)
+        proxies_env = os.environ.get("SELECTEL_PROXIES", "").strip()
+        proxy_pool = ProxyPool.from_env(proxies_env) if proxies_env else None
+        if proxy_pool:
+            log.info("orch.proxy_pool_loaded", count=len(proxy_pool.proxies))
+
         if self.dry_run:
             self._clients = [
                 _DryRunClient("dry-A", priority, region=self._zone),
@@ -242,6 +249,7 @@ class Orchestrator:
                         project_id=a.get("project_id") or None,
                         region=a.get("availability_zone", self._zone),
                         proxy_url=a.get("proxy_url") or None,
+                        proxy_pool=proxy_pool,
                     )
                     for a in enabled
                 ]
@@ -253,6 +261,7 @@ class Orchestrator:
                     project_id=os.environ.get(sel.get("project_id_env", "SELECTEL_PROJECT_ID"), "") or None,
                     region=self._zone,
                     proxy_url=sel.get("proxy_url") or None,
+                    proxy_pool=proxy_pool,
                 )]
 
         self._account_pool = AccountPool(self._clients)

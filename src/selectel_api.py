@@ -4,16 +4,31 @@ from __future__ import annotations
 
 import ipaddress
 import time
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 import requests
 import structlog
+
+if TYPE_CHECKING:
+    from src.proxy_pool import ProxyPool
 
 log = structlog.get_logger(__name__)
 
 
 def _mask_token(token: str) -> str:
     return token[:8] + "..." if len(token) > 8 else "***"
+
+
+def _mask_proxy(proxy_url: str) -> str:
+    """Hide credentials in proxy URL for logging: socks5://user:pass@host → socks5://***@host."""
+    try:
+        if "@" in proxy_url:
+            scheme, rest = proxy_url.split("://", 1)
+            _, host = rest.split("@", 1)
+            return f"{scheme}://***@{host}"
+    except Exception:
+        pass
+    return proxy_url
 
 
 class SelectelAPIError(Exception):
@@ -48,6 +63,7 @@ class SelectelClient:
         password: str = "",
         proxy_url: str | None = None,
         request_timeout: int = 60,
+        proxy_pool: "ProxyPool | None" = None,
     ) -> None:
         self._api_token = api_token
         self._region = region
@@ -58,6 +74,7 @@ class SelectelClient:
         self._password = password
         self._proxies = {"http": proxy_url, "https": proxy_url} if proxy_url else None
         self._request_timeout = request_timeout
+        self._proxy_pool = proxy_pool
         self._keystone_token: str | None = None
         self._token_expires: float = 0.0
         self._session = requests.Session()
@@ -325,22 +342,41 @@ class SelectelClient:
 
         Unlike create_floating_ip, does NOT sleep on rate-limit — the caller
         (AccountPool) is expected to handle the error and switch accounts.
-        """
-        if network_id is None:
-            nets = self.list_external_networks()
-            if not nets:
-                raise SelectelAPIError(0, "No external networks found in region")
-            network_id = nets[0]["id"]
 
-        resp = self._request(
-            "POST",
-            f"{self._net_base}/floatingips",
-            raise_on_rate_limit=True,
-            json={"floatingip": {"floating_network_id": network_id}},
-        )
-        fip: dict = resp.json()["floatingip"]
-        log.info("selectel.fip_created", id=fip["id"], ip=fip.get("floating_ip_address"))
-        return fip
+        If proxy_pool is set, picks one proxy for the entire create call and
+        releases it (starts cooldown) when done.
+        """
+        pool_proxy: str | None = None
+        if self._proxy_pool is not None:
+            pool_proxy = self._proxy_pool.get()
+            if pool_proxy is None:
+                raise SelectelAPIError(0, "ProxyPool exhausted: all proxies are in cooldown")
+
+        old_proxies = self._proxies
+        if pool_proxy is not None:
+            self._proxies = {"http": pool_proxy, "https": pool_proxy}
+        try:
+            if network_id is None:
+                nets = self.list_external_networks()
+                if not nets:
+                    raise SelectelAPIError(0, "No external networks found in region")
+                network_id = nets[0]["id"]
+
+            resp = self._request(
+                "POST",
+                f"{self._net_base}/floatingips",
+                raise_on_rate_limit=True,
+                json={"floatingip": {"floating_network_id": network_id}},
+            )
+            fip: dict = resp.json()["floatingip"]
+            log.info("selectel.fip_created",
+                     id=fip["id"], ip=fip.get("floating_ip_address"),
+                     proxy=_mask_proxy(pool_proxy) if pool_proxy else None)
+            return fip
+        finally:
+            self._proxies = old_proxies
+            if pool_proxy is not None and self._proxy_pool is not None:
+                self._proxy_pool.release(pool_proxy)
 
     def list_servers(self) -> list[dict]:
         """[{id, name, status, addresses, ...}]"""

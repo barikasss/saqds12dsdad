@@ -1,9 +1,10 @@
 import json
-from unittest.mock import MagicMock, patch
+from unittest.mock import MagicMock, patch, create_autospec
 
 import pytest
 import responses as resp_lib
 
+from src.proxy_pool import ProxyPool
 from src.selectel_api import SelectelAPIError, SelectelClient
 
 # ---------------------------------------------------------------------------
@@ -314,3 +315,63 @@ def test_logs_no_secret():
     for event in cap:
         for v in event.values():
             assert API_TOKEN not in str(v), f"API token leaked in log event: {event}"
+
+
+# ---------------------------------------------------------------------------
+# 10. ProxyPool integration — get() and release() called on create_fip_safe
+# ---------------------------------------------------------------------------
+
+@resp_lib.activate
+def test_create_fip_safe_uses_proxy_pool():
+    add_identity_ok(resp_lib)
+    resp_lib.add(resp_lib.GET, NETS_URL, json={"networks": [{"id": "net-pool-1"}]})
+    resp_lib.add(resp_lib.POST, FIP_URL, json={"floatingip": {
+        "id": "fip-pool-1",
+        "floating_ip_address": "87.228.90.55",
+    }}, status=201)
+
+    pool = create_autospec(ProxyPool, instance=True)
+    pool.get.return_value = "socks5://proxy:pass@1.2.3.4:1080"
+
+    client = make_client(proxy_pool=pool)
+    fip = client.create_floating_ip_safe()
+
+    assert fip["id"] == "fip-pool-1"
+    pool.get.assert_called_once()
+    pool.release.assert_called_once_with("socks5://proxy:pass@1.2.3.4:1080")
+
+
+@resp_lib.activate
+def test_create_fip_safe_pool_exhausted_raises():
+    """When ProxyPool.get() returns None, create_floating_ip_safe raises immediately."""
+    pool = create_autospec(ProxyPool, instance=True)
+    pool.get.return_value = None
+
+    client = make_client(proxy_pool=pool)
+    with pytest.raises(SelectelAPIError, match="ProxyPool exhausted"):
+        client.create_floating_ip_safe()
+
+    pool.release.assert_not_called()
+
+
+@resp_lib.activate
+def test_create_fip_safe_releases_on_error():
+    """Proxy is released even when the API call fails."""
+    add_identity_ok(resp_lib)
+    resp_lib.add(resp_lib.GET, NETS_URL, json={"networks": [{"id": "net-err"}]})
+    resp_lib.add(resp_lib.POST, FIP_URL, status=500)
+    resp_lib.add(resp_lib.POST, FIP_URL, status=500)
+    resp_lib.add(resp_lib.POST, FIP_URL, status=500)
+    resp_lib.add(resp_lib.POST, FIP_URL, status=500)
+
+    pool = create_autospec(ProxyPool, instance=True)
+    pool.get.return_value = "socks5://proxy:pass@1.2.3.4:1080"
+
+    client = make_client(proxy_pool=pool)
+    with patch("src.selectel_api.time") as mock_time:
+        mock_time.time.return_value = 0.0
+        mock_time.sleep = MagicMock()
+        with pytest.raises(SelectelAPIError):
+            client.create_floating_ip_safe()
+
+    pool.release.assert_called_once_with("socks5://proxy:pass@1.2.3.4:1080")
