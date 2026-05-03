@@ -286,6 +286,7 @@ class Orchestrator:
         else:
             accounts_cfg: list[dict] = cfg.get("selectel_accounts", [])
             enabled = [a for a in accounts_cfg if a.get("enabled", True)]
+            _default_proxy = os.environ.get("SELECTEL_PROXY_URL") or None
             if enabled:
                 self._clients = [
                     SelectelClient(
@@ -294,7 +295,7 @@ class Orchestrator:
                         password=os.environ.get(a.get("password_env", ""), ""),
                         project_id=a.get("project_id") or None,
                         region=a.get("availability_zone", self._zone),
-                        proxy_url=a.get("proxy_url") or None,
+                        proxy_url=a.get("proxy_url") or _default_proxy,
                         proxy_pool=proxy_pool,
                     )
                     for a in enabled
@@ -306,7 +307,7 @@ class Orchestrator:
                     password=os.environ.get(sel.get("password_env", "SELECTEL_PASSWORD"), ""),
                     project_id=os.environ.get(sel.get("project_id_env", "SELECTEL_PROJECT_ID"), "") or None,
                     region=self._zone,
-                    proxy_url=sel.get("proxy_url") or None,
+                    proxy_url=sel.get("proxy_url") or _default_proxy,
                     proxy_pool=proxy_pool,
                 )]
 
