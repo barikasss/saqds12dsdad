@@ -204,6 +204,7 @@ class Orchestrator:
             "white_found": 0,
             "dead": 0,
             "deleted_not_in_whitelist": 0,
+            "skipped_dead_subnet": 0,
             "total_created": 0,
             "suspects": 0,
             "start_time": datetime.now(timezone.utc).isoformat(),
@@ -290,6 +291,18 @@ class Orchestrator:
             extra_cidrs=priority,
         )
 
+        self._dead_subnets_file = "data/dead_subnets.txt"
+        self._dead_subnets: set[str] = set()
+        dead_path = Path(self._dead_subnets_file)
+        if dead_path.exists():
+            self._dead_subnets = {
+                line.strip()
+                for line in dead_path.read_text().splitlines()
+                if line.strip()
+            }
+            if self._dead_subnets:
+                log.info("orch.dead_cache_loaded", count=len(self._dead_subnets))
+
         nt = cfg.get("notifier", {}).get("telegram", {})
         tg_token = os.environ.get(nt.get("bot_token_env", "TG_BOT_TOKEN"), "")
         tg_chat = os.environ.get(nt.get("chat_id_env", "TG_CHAT_ID"), "")
@@ -360,6 +373,15 @@ class Orchestrator:
             _atomic_write(str(path), existing)
         except Exception as exc:
             log.warning("orch.save_suspect_failed", error=str(exc))
+
+    def _append_dead_subnet(self, cidr: str) -> None:
+        try:
+            path = Path(self._dead_subnets_file)
+            path.parent.mkdir(exist_ok=True)
+            with open(path, "a") as f:
+                f.write(cidr + "\n")
+        except Exception as exc:
+            log.warning("orch.dead_cache_write_error", cidr=cidr, error=str(exc))
 
     @staticmethod
     def _safe_delete(client, fip_id: str) -> None:
@@ -532,6 +554,14 @@ class Orchestrator:
                              ip=ip, subnet=subnet)
                     continue
 
+                if subnet in self._dead_subnets:
+                    self._safe_delete(client, fip["id"])
+                    self._log_ip(ip, event="deleted", subnet=subnet,
+                                 reason="dead_subnet_cached", account=client.username)
+                    self.stats["skipped_dead_subnet"] += 1
+                    log.info("orch.skipped_dead_subnet", ip=ip, subnet=subnet)
+                    continue
+
                 task = SubnetTask(
                     cidr=subnet,
                     fip_id=fip["id"],
@@ -627,6 +657,9 @@ class Orchestrator:
                 self._log_ip(task.fip_ip, event="deleted", subnet=task.cidr,
                              reason="icmp_dead", account=task.account)
                 self.stats["dead"] += 1
+                if task.cidr not in self._dead_subnets:
+                    self._dead_subnets.add(task.cidr)
+                    self._append_dead_subnet(task.cidr)
                 to_remove.append(task)
                 continue
 

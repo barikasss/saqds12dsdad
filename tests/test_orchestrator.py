@@ -9,6 +9,8 @@ import responses
 import yaml
 
 from src.checkers.wl_pool import WLKeyPool
+from pathlib import Path
+
 from src.orchestrator import (
     AccountPool,
     MAX_FIPS_PER_ACCOUNT,
@@ -237,3 +239,92 @@ def test_rate_limit_sleep(write_config, monkeypatch):
     assert sleeps, "orchestrator did not sleep when all accounts were blocked"
     assert sleeps[0] > 0
     assert sleeps[0] <= 120  # clamped
+
+
+# ---------------------------------------------------------------------------
+# 6. Dead subnet cache
+# ---------------------------------------------------------------------------
+
+def test_dead_subnet_loaded_from_file(write_config, tmp_path):
+    """Dead subnets file is read at startup into _dead_subnets."""
+    data_dir = tmp_path / "data"
+    data_dir.mkdir(exist_ok=True)
+    (data_dir / "dead_subnets.txt").write_text("10.0.0.0/24\n192.168.1.0/24\n")
+
+    orch = Orchestrator(config_path=write_config, dry_run=True)
+
+    assert "10.0.0.0/24" in orch._dead_subnets
+    assert "192.168.1.0/24" in orch._dead_subnets
+
+
+def test_dead_subnet_skipped_in_create_phase(write_config, tmp_path):
+    """FIP in a known-dead /24 is deleted immediately without creating a task."""
+    data_dir = tmp_path / "data"
+    data_dir.mkdir(exist_ok=True)
+    (data_dir / "dead_subnets.txt").write_text("10.0.0.0/24\n")
+
+    orch = Orchestrator(config_path=write_config, dry_run=True)
+
+    dead_fip = {"id": "f-dead", "floating_ip_address": "10.0.0.5"}
+
+    fake = MagicMock()
+    fake.username = "fake"
+    fake._region = "ru-2"
+    fake.list_floating_ips.return_value = []
+    fake.create_floating_ip_safe.side_effect = [
+        dead_fip,
+        SelectelRateLimitError(429, "stop"),
+    ]
+    fake.delete_floating_ip.return_value = True
+
+    orch._clients = [fake]
+    orch._account_pool = AccountPool([fake])
+
+    orch._create_phase()
+
+    fake.delete_floating_ip.assert_called_once_with("f-dead")
+    assert orch._pending_tasks == []
+    assert orch.stats["skipped_dead_subnet"] == 1
+
+
+def test_dead_decision_writes_to_cache(write_config, tmp_path):
+    """ICMP=False → subnet added to _dead_subnets in memory and written to file."""
+    orch = Orchestrator(config_path=write_config, dry_run=True)
+
+    task = SubnetTask(
+        cidr="10.0.0.0/24",
+        fip_id="f-1",
+        fip_ip="10.0.0.5",
+        account="dry-A",
+        client=orch._account_pool.clients[0],
+        icmp_result=False,
+    )
+    orch._pending_tasks.append(task)
+
+    orch._decision_phase()
+
+    assert "10.0.0.0/24" in orch._dead_subnets
+    dead_file = tmp_path / "data" / "dead_subnets.txt"
+    assert dead_file.exists()
+    assert "10.0.0.0/24" in dead_file.read_text()
+
+
+def test_dead_subnet_not_duplicated_in_file(write_config, tmp_path):
+    """Same dead subnet is not appended twice if it's already in the cache."""
+    orch = Orchestrator(config_path=write_config, dry_run=True)
+    orch._dead_subnets.add("10.0.0.0/24")  # already in cache
+
+    task = SubnetTask(
+        cidr="10.0.0.0/24",
+        fip_id="f-2",
+        fip_ip="10.0.0.7",
+        account="dry-A",
+        client=orch._account_pool.clients[0],
+        icmp_result=False,
+    )
+    orch._pending_tasks.append(task)
+    orch._decision_phase()
+
+    # File should not exist (was never written since cidr was already cached)
+    dead_file = tmp_path / "data" / "dead_subnets.txt"
+    assert not dead_file.exists()
