@@ -15,7 +15,7 @@
 | 4 | `src/orchestrator.py` — ICMP + WL параллельно | ✅ готово |
 | 5 | `src/orchestrator.py` — OR логика + не останавливаться | ✅ готово |
 | 6 | `src/job_server.py` — FastAPI на VM | ✅ готово |
-| 7 | `ping_agent.py` — Samsung агент | ⬜ не начато |
+| 7 | `ping_agent.py` — Samsung агент | ✅ готово |
 | 8 | `src/orchestrator.py` — интеграция с job server | ⬜ не начато |
 | 9 | Тесты + проверка на тестовом сервере | ⬜ не начато |
 
