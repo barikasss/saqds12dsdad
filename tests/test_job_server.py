@@ -111,6 +111,29 @@ def test_auth_wrong_secret():
     assert r.status_code == 403
 
 
+def test_enqueue_endpoint_adds_job():
+    r = client.post("/enqueue", json={"cidr": "10.0.0.0/24"}, headers=HEADERS)
+    assert r.status_code == 204
+
+    jobs = client.get("/ping-jobs", headers=HEADERS).json()
+    assert "10.0.0.0/24" in jobs
+
+
+def test_get_ping_result_not_ready():
+    js.enqueue("10.0.0.0/24")
+    r = client.get("/ping-results", params={"cidr": "10.0.0.0/24"}, headers=HEADERS)
+    assert r.status_code == 404
+
+
+def test_get_ping_result_ready():
+    js.enqueue("10.0.0.0/24")
+    js._results["10.0.0.0/24"] = 17
+
+    r = client.get("/ping-results", params={"cidr": "10.0.0.0/24"}, headers=HEADERS)
+    assert r.status_code == 200
+    assert r.json() == {"cidr": "10.0.0.0/24", "alive": 17}
+
+
 def test_clear_removes_job_and_result():
     js.enqueue("10.0.0.0/24")
     js._results["10.0.0.0/24"] = 3

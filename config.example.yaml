@@ -40,6 +40,11 @@ notifier:
     bot_token_env: TG_BOT_TOKEN
     chat_id_env: TG_CHAT_ID
     proxy_url: ""  # socks5://127.0.0.1:10808
+ping_agent:
+  enabled: false          # true = Samsung ICMP agent via job server
+  url: "http://VM_IP:8888"
+  secret_env: PING_AGENT_SECRET
+  timeout_seconds: 60
 search:
   priority_subnets:
     - 87.228.90.0/24

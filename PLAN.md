@@ -16,7 +16,7 @@
 | 5 | `src/orchestrator.py` — OR логика + не останавливаться | ✅ готово |
 | 6 | `src/job_server.py` — FastAPI на VM | ✅ готово |
 | 7 | `ping_agent.py` — Samsung агент | ✅ готово |
-| 8 | `src/orchestrator.py` — интеграция с job server | ⬜ не начато |
+| 8 | `src/orchestrator.py` — интеграция с job server | ✅ готово |
 | 9 | Тесты + проверка на тестовом сервере | ⬜ не начато |
 
 ---

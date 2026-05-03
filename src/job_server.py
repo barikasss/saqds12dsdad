@@ -101,6 +101,29 @@ def post_ping_results(result: PingResult, _: Auth) -> None:
 
 
 # ---------------------------------------------------------------------------
+# Orchestrator-facing HTTP endpoints (used when orchestrator is a separate process)
+# ---------------------------------------------------------------------------
+
+class EnqueueRequest(BaseModel):
+    cidr: str
+
+
+@app.post("/enqueue", status_code=204)
+def enqueue_job(req: EnqueueRequest, _: Auth) -> None:
+    """Add a CIDR to the job queue (called by orchestrator)."""
+    enqueue(req.cidr)
+
+
+@app.get("/ping-results")
+def get_ping_result(cidr: str, _: Auth) -> dict:
+    """Return alive count for a CIDR if result is ready, else 404."""
+    result = get_result(cidr)
+    if result is None:
+        raise HTTPException(status_code=404, detail="No result yet")
+    return {"cidr": cidr, "alive": result}
+
+
+# ---------------------------------------------------------------------------
 # Internal API — called by orchestrator (same process)
 # ---------------------------------------------------------------------------
 

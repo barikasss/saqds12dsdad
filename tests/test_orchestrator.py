@@ -15,6 +15,7 @@ from src.orchestrator import (
     AccountPool,
     MAX_FIPS_PER_ACCOUNT,
     Orchestrator,
+    PingAgentClient,
     SubnetTask,
 )
 from src.selectel_api import SelectelRateLimitError
@@ -355,6 +356,79 @@ def test_dead_decision_writes_to_cache(write_config, tmp_path):
     dead_file = tmp_path / "data" / "dead_subnets.txt"
     assert dead_file.exists()
     assert "10.0.0.0/24" in dead_file.read_text()
+
+
+# ---------------------------------------------------------------------------
+# 7. PingAgentClient integration
+# ---------------------------------------------------------------------------
+
+def test_remote_icmp_enqueues_and_receives_result(write_config):
+    """When ping_client is set, _verify_phase enqueues CIDRs and picks up results."""
+    orch = Orchestrator(config_path=write_config, dry_run=True)
+
+    mock_client = MagicMock(spec=PingAgentClient)
+    mock_client.enqueue.return_value = True
+    mock_client.get_result.return_value = 12  # 12 alive
+    mock_client.timeout_seconds = 60
+    orch._ping_client = mock_client
+
+    task = SubnetTask(
+        cidr="10.0.0.0/24", fip_id="f-1", fip_ip="10.0.0.5",
+        account="dry-A", client=orch._account_pool.clients[0],
+    )
+    orch._pending_tasks.append(task)
+    task.icmp_enqueued = True  # simulate already enqueued
+
+    orch._verify_phase()
+
+    assert task.icmp_result is True
+    mock_client.get_result.assert_called_once_with("10.0.0.0/24")
+
+
+def test_remote_icmp_enqueues_on_first_call(write_config):
+    """First _verify_phase call enqueues the task, second one polls result."""
+    orch = Orchestrator(config_path=write_config, dry_run=True)
+
+    mock_client = MagicMock(spec=PingAgentClient)
+    mock_client.enqueue.return_value = True
+    mock_client.get_result.return_value = None  # not ready yet
+    mock_client.timeout_seconds = 60
+    orch._ping_client = mock_client
+
+    task = SubnetTask(
+        cidr="10.0.0.0/24", fip_id="f-1", fip_ip="10.0.0.5",
+        account="dry-A", client=orch._account_pool.clients[0],
+    )
+    orch._pending_tasks.append(task)
+
+    orch._verify_phase()
+
+    mock_client.enqueue.assert_called_once_with("10.0.0.0/24")
+    assert task.icmp_enqueued is True
+    assert task.icmp_result is None  # still waiting
+
+
+def test_remote_icmp_timeout(write_config):
+    """Task older than timeout_seconds gets icmp_result=False."""
+    import time as _time
+    orch = Orchestrator(config_path=write_config, dry_run=True)
+
+    mock_client = MagicMock(spec=PingAgentClient)
+    mock_client.get_result.return_value = None
+    mock_client.timeout_seconds = 10
+    orch._ping_client = mock_client
+
+    task = SubnetTask(
+        cidr="10.0.0.0/24", fip_id="f-1", fip_ip="10.0.0.5",
+        account="dry-A", client=orch._account_pool.clients[0],
+    )
+    task.icmp_enqueued = True
+    task.created_at = _time.time() - 120  # 120s old, well past timeout
+    orch._pending_tasks.append(task)
+
+    orch._verify_phase()
+
+    assert task.icmp_result is False
 
 
 def test_dead_subnet_not_duplicated_in_file(write_config, tmp_path):

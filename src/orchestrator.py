@@ -18,6 +18,7 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any
 
+import requests
 import structlog
 
 from src.checkers.icmp_checker import ICMPChecker
@@ -175,10 +176,53 @@ class SubnetTask:
     account: str
     client: Any
     icmp_result: bool | None = None
+    icmp_enqueued: bool = False
     wl_job_id: str | None = None
     wl_key: str | None = None
     wl_result: bool | None = None
     created_at: float = field(default_factory=time.time)
+
+
+# ---------------------------------------------------------------------------
+# PingAgentClient — HTTP client for remote Samsung ICMP via job server
+# ---------------------------------------------------------------------------
+
+class PingAgentClient:
+    """Talks to job_server HTTP API to enqueue CIDRs and poll results."""
+
+    def __init__(self, url: str, secret: str, timeout_seconds: int = 60) -> None:
+        self.url = url.rstrip("/")
+        self.timeout_seconds = timeout_seconds
+        self._headers = {"X-Secret": secret}
+        self._session = requests.Session()
+
+    def enqueue(self, cidr: str) -> bool:
+        try:
+            r = self._session.post(
+                f"{self.url}/enqueue",
+                json={"cidr": cidr},
+                headers=self._headers,
+                timeout=5,
+            )
+            return r.status_code in (200, 204)
+        except Exception as exc:
+            log.warning("ping_client.enqueue_error", cidr=cidr, error=str(exc))
+            return False
+
+    def get_result(self, cidr: str) -> int | None:
+        try:
+            r = self._session.get(
+                f"{self.url}/ping-results",
+                params={"cidr": cidr},
+                headers=self._headers,
+                timeout=5,
+            )
+            if r.status_code == 200:
+                return r.json().get("alive")
+            return None
+        except Exception as exc:
+            log.warning("ping_client.result_error", cidr=cidr, error=str(exc))
+            return None
 
 
 # ---------------------------------------------------------------------------
@@ -313,6 +357,18 @@ class Orchestrator:
             enabled=bool(tg_token and tg_chat),
             proxy_url=proxy_url,
         )
+
+        pa_cfg = cfg.get("ping_agent", {})
+        if pa_cfg.get("enabled", False):
+            pa_secret = os.environ.get(pa_cfg.get("secret_env", "PING_AGENT_SECRET"), "")
+            self._ping_client: PingAgentClient | None = PingAgentClient(
+                url=pa_cfg.get("url", ""),
+                secret=pa_secret,
+                timeout_seconds=pa_cfg.get("timeout_seconds", 60),
+            )
+            log.info("orch.ping_agent_enabled", url=self._ping_client.url)
+        else:
+            self._ping_client = None
 
         self.ip_log_file = "data/ip_log.jsonl"
 
@@ -587,8 +643,28 @@ class Orchestrator:
         if not self._pending_tasks:
             return
 
-        # Step 1 — ICMP probe for tasks without result (skip if --no-icmp)
-        if not self.no_icmp:
+        # Step 1 — ICMP probe (remote via Samsung agent OR local)
+        if self._ping_client is not None and not self.no_icmp:
+            # Remote ICMP: enqueue new tasks, poll results
+            for task in self._pending_tasks:
+                if task.icmp_result is None and not task.icmp_enqueued:
+                    if self._ping_client.enqueue(task.cidr):
+                        task.icmp_enqueued = True
+                        log.info("orch.remote_icmp_enqueued", cidr=task.cidr)
+
+            for task in self._pending_tasks:
+                if task.icmp_result is None and task.icmp_enqueued:
+                    result = self._ping_client.get_result(task.cidr)
+                    if result is not None:
+                        task.icmp_result = result > 0
+                        log.info("orch.remote_icmp_done",
+                                 cidr=task.cidr, alive=result)
+                    elif time.time() - task.created_at > self._ping_client.timeout_seconds:
+                        log.warning("orch.remote_icmp_timeout", cidr=task.cidr)
+                        task.icmp_result = False
+
+        elif not self.no_icmp:
+            # Local ICMP
             todo = [t for t in self._pending_tasks if t.icmp_result is None]
             if todo:
                 with ThreadPoolExecutor(max_workers=min(8, len(todo))) as ex:
