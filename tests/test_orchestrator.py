@@ -99,9 +99,8 @@ def test_subnet_task_flow(write_config):
     assert orch.stats["white_found"] == 1
 
 
-def test_subnet_task_icmp_fallback(write_config):
-    """ICMP alive but WL unavailable (no keys) >120s → winner by fallback."""
-    import time
+def test_subnet_task_icmp_alone_wins(write_config):
+    """OR logic: ICMP=True alone is enough to win, WL not needed."""
     orch = Orchestrator(config_path=write_config, dry_run=True)
 
     task = SubnetTask(
@@ -111,10 +110,30 @@ def test_subnet_task_icmp_fallback(write_config):
         account="dry-A",
         client=orch._account_pool.clients[0],
         icmp_result=True,
-        wl_job_id=None,
-        wl_result=None,
+        wl_result=None,  # WL not yet received
     )
-    task.created_at = time.time() - 200  # simulate 200s old task
+    orch._pending_tasks.append(task)
+
+    winner = orch._decision_phase()
+
+    assert winner is task
+    assert orch.stats["white_found"] == 1
+    assert task not in orch._pending_tasks
+
+
+def test_subnet_task_wl_alone_wins(write_config):
+    """OR logic: WL=True alone is enough to win even if ICMP=False."""
+    orch = Orchestrator(config_path=write_config, dry_run=True)
+
+    task = SubnetTask(
+        cidr="10.0.0.0/24",
+        fip_id="dry-1",
+        fip_ip="10.0.0.5",
+        account="dry-A",
+        client=orch._account_pool.clients[0],
+        icmp_result=False,
+        wl_result=True,
+    )
     orch._pending_tasks.append(task)
 
     winner = orch._decision_phase()
@@ -123,28 +142,56 @@ def test_subnet_task_icmp_fallback(write_config):
     assert orch.stats["white_found"] == 1
 
 
-def test_subnet_task_suspect(write_config):
-    """ICMP alive but WL dead → suspect: FIP kept, stats updated, no deletion."""
+def test_subnet_task_waits_when_icmp_false_wl_pending(write_config):
+    """ICMP=False but WL not yet done → wait (can't declare dead yet)."""
     orch = Orchestrator(config_path=write_config, dry_run=True)
-    client = orch._account_pool.clients[0]
 
     task = SubnetTask(
         cidr="10.0.0.0/24",
         fip_id="dry-1",
         fip_ip="10.0.0.5",
         account="dry-A",
-        client=client,
-        icmp_result=True,
-        wl_result=False,
+        client=orch._account_pool.clients[0],
+        icmp_result=False,
+        wl_result=None,
     )
     orch._pending_tasks.append(task)
 
     winner = orch._decision_phase()
 
     assert winner is None
-    assert orch.stats["suspects"] == 1
     assert orch.stats["dead"] == 0
-    assert task not in orch._pending_tasks
+    assert task in orch._pending_tasks  # still waiting
+
+
+def test_subnet_task_never_stops_on_win(write_config):
+    """Winner found → script continues (no sys.exit), pending tasks unaffected."""
+    orch = Orchestrator(config_path=write_config, dry_run=True)
+
+    winner_task = SubnetTask(
+        cidr="10.0.0.0/24",
+        fip_id="dry-1",
+        fip_ip="10.0.0.5",
+        account="dry-A",
+        client=orch._account_pool.clients[0],
+        icmp_result=True,
+        wl_result=True,
+    )
+    other_task = SubnetTask(
+        cidr="10.0.1.0/24",
+        fip_id="dry-2",
+        fip_ip="10.0.1.5",
+        account="dry-A",
+        client=orch._account_pool.clients[0],
+        icmp_result=None,  # still pending
+    )
+    orch._pending_tasks.extend([winner_task, other_task])
+
+    winner = orch._decision_phase()
+
+    assert winner is winner_task
+    assert winner_task not in orch._pending_tasks
+    assert other_task in orch._pending_tasks  # untouched
 
 
 # ---------------------------------------------------------------------------
@@ -288,7 +335,7 @@ def test_dead_subnet_skipped_in_create_phase(write_config, tmp_path):
 
 
 def test_dead_decision_writes_to_cache(write_config, tmp_path):
-    """ICMP=False → subnet added to _dead_subnets in memory and written to file."""
+    """ICMP=False AND WL=False → subnet added to _dead_subnets and written to file."""
     orch = Orchestrator(config_path=write_config, dry_run=True)
 
     task = SubnetTask(
@@ -298,6 +345,7 @@ def test_dead_decision_writes_to_cache(write_config, tmp_path):
         account="dry-A",
         client=orch._account_pool.clients[0],
         icmp_result=False,
+        wl_result=False,
     )
     orch._pending_tasks.append(task)
 
@@ -321,6 +369,7 @@ def test_dead_subnet_not_duplicated_in_file(write_config, tmp_path):
         account="dry-A",
         client=orch._account_pool.clients[0],
         icmp_result=False,
+        wl_result=False,
     )
     orch._pending_tasks.append(task)
     orch._decision_phase()
