@@ -590,6 +590,11 @@ class Orchestrator:
                             client,
                             datetime.now(timezone.utc) + timedelta(seconds=30),
                         )
+                    elif "OverQuota" in err_str:
+                        self._account_pool.mark_rate_limited(
+                            client,
+                            datetime.now(timezone.utc) + timedelta(seconds=120),
+                        )
                     break
 
                 fips_count += 1  # counts toward MAX even if we delete below
