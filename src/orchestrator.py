@@ -628,6 +628,14 @@ class Orchestrator:
                     )
                 continue
 
+            if not new_fips:
+                log.warning("orch.fip_create_zero", account=client.username)
+                self._account_pool.mark_rate_limited(
+                    client,
+                    datetime.now(timezone.utc) + timedelta(seconds=30),
+                )
+                continue
+
             for fip in new_fips:
                 if not self._running:
                     break
