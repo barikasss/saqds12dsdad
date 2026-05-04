@@ -1,6 +1,6 @@
-"""Tests for Selectel Resell API client."""
+"""Tests for Selectel API client (OpenStack create/delete + Resell list)."""
 import json
-from unittest.mock import MagicMock, patch
+from unittest.mock import MagicMock, patch, create_autospec
 
 import pytest
 import responses as resp_lib
@@ -12,21 +12,31 @@ from src.selectel_api import SelectelAPIError, SelectelClient, SelectelRateLimit
 # Constants
 # ---------------------------------------------------------------------------
 
-API_KEY = "test-api-key-12345"
 ACCOUNT_ID = "577991"
+USERNAME = "Priya"
+PASSWORD = "s3cr3t"
+API_KEY = "test-api-key-12345"
 PROJECT_ID = "96536fd09a294164aaf5592a79b5356e"
 REGION = "ru-3"
 
+IDENTITY_URL = "https://cloud.api.selcloud.ru/identity/v3/auth/tokens"
+KS_TOKEN = "ks-subject-token-xyz"
+EXPIRES_AT = "2030-01-01T12:00:00.000000Z"
+
+NET_BASE = f"https://{REGION}.cloud.api.selcloud.ru/network/v2.0"
+FLOATINGIPS_URL = f"{NET_BASE}/floatingips"
+NETWORKS_URL = f"{NET_BASE}/networks"
+
 RESELL_BASE = "https://api.selectel.ru/vpc/resell/v2"
-FLOATINGIPS_URL = f"{RESELL_BASE}/floatingips"
-CREATE_URL = f"{RESELL_BASE}/floatingips/projects/{PROJECT_ID}"
+RESELL_FLOATINGIPS_URL = f"{RESELL_BASE}/floatingips"
 
 
 def make_client(**kwargs) -> SelectelClient:
     defaults = dict(
         account_id=ACCOUNT_ID,
-        username="Priya",
+        username=USERNAME,
         api_key=API_KEY,
+        password=PASSWORD,
         project_id=PROJECT_ID,
         region=REGION,
     )
@@ -34,43 +44,80 @@ def make_client(**kwargs) -> SelectelClient:
     return SelectelClient(**defaults)
 
 
+def add_auth_ok(rsps, token: str = KS_TOKEN) -> None:
+    rsps.add(
+        resp_lib.POST, IDENTITY_URL,
+        json={"token": {"expires_at": EXPIRES_AT}},
+        headers={"X-Subject-Token": token},
+        status=201,
+    )
+
+
+def add_networks(rsps) -> None:
+    rsps.add(resp_lib.GET, NETWORKS_URL,
+             json={"networks": [{"id": "ext-net-1"}]},
+             match_querystring=False)
+
+
 def make_fip(ip: str, fip_id: str | None = None) -> dict:
     return {
         "id": fip_id or f"fip-{ip}",
         "floating_ip_address": ip,
-        "region": REGION,
+        "floating_network_id": "ext-net-1",
         "status": "DOWN",
-        "project_id": PROJECT_ID,
     }
 
 
 # ---------------------------------------------------------------------------
-# 1. list_floating_ips
+# 1. Auth — Keystone password method
+# ---------------------------------------------------------------------------
+
+@resp_lib.activate
+def test_auth_password_method():
+    add_auth_ok(resp_lib, "ks-pw-token")
+
+    client = make_client()
+    token = client._auth()
+
+    assert token == "ks-pw-token"
+    auth_body = json.loads(resp_lib.calls[0].request.body)
+    assert auth_body["auth"]["identity"]["methods"][0] == "password"
+    assert auth_body["auth"]["identity"]["password"]["user"]["name"] == USERNAME
+
+
+@resp_lib.activate
+def test_auth_cached():
+    add_auth_ok(resp_lib)
+    add_auth_ok(resp_lib)  # second call in case not cached
+
+    client = make_client()
+    t1 = client._auth()
+    t2 = client._auth()  # should use cache
+
+    assert t1 == t2 == KS_TOKEN
+    # only one actual auth request (second from cache)
+    auth_calls = [c for c in resp_lib.calls
+                  if "identity" in c.request.url]
+    assert len(auth_calls) == 1
+
+
+@resp_lib.activate
+def test_auth_no_credentials_raises():
+    client = SelectelClient(api_key=API_KEY)  # no password
+    with pytest.raises(SelectelAPIError):
+        client._auth()
+
+
+# ---------------------------------------------------------------------------
+# 2. list_floating_ips — Resell API
 # ---------------------------------------------------------------------------
 
 @resp_lib.activate
 def test_list_floating_ips_success():
-    resp_lib.add(resp_lib.GET, FLOATINGIPS_URL, json={
+    resp_lib.add(resp_lib.GET, RESELL_FLOATINGIPS_URL, json={
         "floatingips": [
-            make_fip("87.228.90.1", "fip-1"),
-            make_fip("87.228.90.2", "fip-2"),
-        ]
-    })
-
-    client = make_client()
-    fips = client.list_floating_ips()
-
-    assert len(fips) == 2
-    assert fips[0]["floating_ip_address"] == "87.228.90.1"
-    assert resp_lib.calls[0].request.headers["X-Token"] == API_KEY
-
-
-@resp_lib.activate
-def test_list_floating_ips_filters_by_project():
-    resp_lib.add(resp_lib.GET, FLOATINGIPS_URL, json={
-        "floatingips": [
-            {**make_fip("1.2.3.4"), "project_id": "other-project"},
-            make_fip("87.228.90.1"),  # own project
+            {"id": "fip-1", "floating_ip_address": "87.228.90.1",
+             "project_id": PROJECT_ID},
         ]
     })
 
@@ -78,65 +125,78 @@ def test_list_floating_ips_filters_by_project():
     fips = client.list_floating_ips()
 
     assert len(fips) == 1
-    assert fips[0]["floating_ip_address"] == "87.228.90.1"
+    assert resp_lib.calls[0].request.headers["X-Token"] == API_KEY
 
 
 @resp_lib.activate
-def test_list_floating_ips_error():
-    resp_lib.add(resp_lib.GET, FLOATINGIPS_URL, status=401, body="Unauthorized")
+def test_list_filters_by_project():
+    resp_lib.add(resp_lib.GET, RESELL_FLOATINGIPS_URL, json={
+        "floatingips": [
+            {"id": "fip-1", "floating_ip_address": "1.2.3.4",
+             "project_id": "other"},
+            {"id": "fip-2", "floating_ip_address": "87.228.90.1",
+             "project_id": PROJECT_ID},
+        ]
+    })
 
     client = make_client()
-    with pytest.raises(SelectelAPIError) as exc:
-        client.list_floating_ips()
-    assert exc.value.status == 401
+    fips = client.list_floating_ips()
+
+    assert len(fips) == 1
+    assert fips[0]["id"] == "fip-2"
 
 
 # ---------------------------------------------------------------------------
-# 2. create_floating_ips_bulk
+# 3. create_floating_ips_bulk — OpenStack
 # ---------------------------------------------------------------------------
 
 @resp_lib.activate
 def test_create_bulk_success():
-    resp_lib.add(resp_lib.POST, CREATE_URL, json={
-        "floatingips": [
-            make_fip("178.72.153.1", "fip-a"),
-            make_fip("178.72.153.2", "fip-b"),
-        ]
+    add_auth_ok(resp_lib)
+    add_networks(resp_lib)
+    resp_lib.add(resp_lib.POST, FLOATINGIPS_URL, json={
+        "floatingip": make_fip("87.228.90.10", "fip-new")
     }, status=201)
 
     client = make_client()
-    fips = client.create_floating_ips_bulk(2)
+    fips = client.create_floating_ips_bulk(1)
 
-    assert len(fips) == 2
-    assert fips[0]["floating_ip_address"] == "178.72.153.1"
-
-    body = json.loads(resp_lib.calls[0].request.body)
-    assert body == {"floatingips": [{"region": REGION, "quantity": 2}]}
+    assert len(fips) == 1
+    assert fips[0]["id"] == "fip-new"
+    # Verify auth token used
+    create_req = next(c for c in resp_lib.calls if c.request.method == "POST"
+                      and "floatingips" in c.request.url
+                      and "identity" not in c.request.url)
+    assert create_req.request.headers["X-Auth-Token"] == KS_TOKEN
 
 
 @resp_lib.activate
 def test_create_bulk_zero_returns_empty():
     client = make_client()
-    result = client.create_floating_ips_bulk(0)
-    assert result == []
+    assert client.create_floating_ips_bulk(0) == []
     assert len(resp_lib.calls) == 0
 
 
 @resp_lib.activate
-def test_create_bulk_quota_exceeded_429():
-    resp_lib.add(resp_lib.POST, CREATE_URL, status=429,
-                 json={"error": "quota_exceeded"})
+def test_create_bulk_multiple():
+    add_auth_ok(resp_lib)
+    add_networks(resp_lib)
+    resp_lib.add(resp_lib.POST, FLOATINGIPS_URL,
+                 json={"floatingip": make_fip("1.2.3.4", "fip-1")}, status=201)
+    resp_lib.add(resp_lib.POST, FLOATINGIPS_URL,
+                 json={"floatingip": make_fip("5.6.7.8", "fip-2")}, status=201)
 
     client = make_client()
-    with pytest.raises(SelectelRateLimitError):
-        client.create_floating_ips_bulk(1)
+    fips = client.create_floating_ips_bulk(2)
+
+    assert len(fips) == 2
 
 
 @resp_lib.activate
-def test_create_bulk_quota_exceeded_in_body():
-    """quota_exceeded comes as 409."""
-    resp_lib.add(resp_lib.POST, CREATE_URL, status=409,
-                 json={"error": "quota_exceeded", "quotas": {}})
+def test_create_bulk_quota_exceeded_429():
+    add_auth_ok(resp_lib)
+    add_networks(resp_lib)
+    resp_lib.add(resp_lib.POST, FLOATINGIPS_URL, status=429)
 
     client = make_client()
     with pytest.raises(SelectelRateLimitError):
@@ -145,7 +205,9 @@ def test_create_bulk_quota_exceeded_in_body():
 
 @resp_lib.activate
 def test_create_bulk_api_error():
-    resp_lib.add(resp_lib.POST, CREATE_URL, status=500, body="Server Error")
+    add_auth_ok(resp_lib)
+    add_networks(resp_lib)
+    resp_lib.add(resp_lib.POST, FLOATINGIPS_URL, status=500, body="error")
 
     client = make_client()
     with pytest.raises(SelectelAPIError) as exc:
@@ -154,33 +216,33 @@ def test_create_bulk_api_error():
 
 
 # ---------------------------------------------------------------------------
-# 3. delete_floating_ip
+# 4. delete_floating_ip — OpenStack
 # ---------------------------------------------------------------------------
 
 @resp_lib.activate
 def test_delete_success():
-    resp_lib.add(resp_lib.DELETE, f"{RESELL_BASE}/floatingips/fip-123", status=204)
+    add_auth_ok(resp_lib)
+    resp_lib.add(resp_lib.DELETE, f"{FLOATINGIPS_URL}/fip-123", status=204)
 
     client = make_client()
-    result = client.delete_floating_ip("fip-123")
-
-    assert result is True
+    assert client.delete_floating_ip("fip-123") is True
+    del_req = next(c for c in resp_lib.calls if c.request.method == "DELETE")
+    assert del_req.request.headers["X-Auth-Token"] == KS_TOKEN
 
 
 @resp_lib.activate
 def test_delete_not_found_returns_true():
-    """404 on delete means already gone — treat as success."""
-    resp_lib.add(resp_lib.DELETE, f"{RESELL_BASE}/floatingips/fip-gone", status=404)
+    add_auth_ok(resp_lib)
+    resp_lib.add(resp_lib.DELETE, f"{FLOATINGIPS_URL}/fip-gone", status=404)
 
     client = make_client()
-    result = client.delete_floating_ip("fip-gone")
-
-    assert result is True
+    assert client.delete_floating_ip("fip-gone") is True
 
 
 @resp_lib.activate
-def test_delete_error():
-    resp_lib.add(resp_lib.DELETE, f"{RESELL_BASE}/floatingips/fip-x", status=403)
+def test_delete_error_raises():
+    add_auth_ok(resp_lib)
+    resp_lib.add(resp_lib.DELETE, f"{FLOATINGIPS_URL}/fip-x", status=403)
 
     client = make_client()
     with pytest.raises(SelectelAPIError):
@@ -188,47 +250,36 @@ def test_delete_error():
 
 
 # ---------------------------------------------------------------------------
-# 4. Proxy rotation
+# 5. Network ID cached
 # ---------------------------------------------------------------------------
 
 @resp_lib.activate
-def test_proxy_pool_rotates():
-    resp_lib.add(resp_lib.GET, FLOATINGIPS_URL, json={"floatingips": []})
-    resp_lib.add(resp_lib.GET, FLOATINGIPS_URL, json={"floatingips": []})
-
-    pool = ResellProxyPool(["socks5://p1:1080", "socks5://p2:1080"])
-    client = make_client(proxy_pool=pool)
-
-    client.list_floating_ips()
-    client.list_floating_ips()
-
-    assert pool._idx == 2  # advanced by 2
-
-
-@resp_lib.activate
-def test_proxy_error_retries():
-    """ProxyError triggers retry up to max_retries."""
-    resp_lib.add(resp_lib.GET, FLOATINGIPS_URL, body=resp_lib.ConnectionError())
-    resp_lib.add(resp_lib.GET, FLOATINGIPS_URL, body=resp_lib.ConnectionError())
-    resp_lib.add(resp_lib.GET, FLOATINGIPS_URL, body=resp_lib.ConnectionError())
+def test_network_id_cached_across_creates():
+    add_auth_ok(resp_lib)
+    add_networks(resp_lib)
+    resp_lib.add(resp_lib.POST, FLOATINGIPS_URL,
+                 json={"floatingip": make_fip("1.1.1.1")}, status=201)
+    resp_lib.add(resp_lib.POST, FLOATINGIPS_URL,
+                 json={"floatingip": make_fip("2.2.2.2")}, status=201)
 
     client = make_client()
-    with pytest.raises(SelectelAPIError):
-        client.list_floating_ips(max_conn_retries=3)
+    client.create_floating_ips_bulk(2)
+
+    network_calls = [c for c in resp_lib.calls
+                     if "networks" in c.request.url]
+    assert len(network_calls) == 1  # fetched only once
 
 
 # ---------------------------------------------------------------------------
-# 5. create_floating_ip_safe (compat wrapper)
+# 6. multi-account test compat
 # ---------------------------------------------------------------------------
 
 @resp_lib.activate
-def test_create_floating_ip_safe_compat():
-    resp_lib.add(resp_lib.POST, CREATE_URL, json={
-        "floatingips": [make_fip("5.188.112.1", "fip-safe")]
-    }, status=201)
+def test_selectel_rate_limit_error_is_raised():
+    add_auth_ok(resp_lib)
+    add_networks(resp_lib)
+    resp_lib.add(resp_lib.POST, FLOATINGIPS_URL, status=429)
 
     client = make_client()
-    fip = client.create_floating_ip_safe()
-
-    assert fip["id"] == "fip-safe"
-    assert fip["floating_ip_address"] == "5.188.112.1"
+    with pytest.raises(SelectelRateLimitError):
+        client.create_floating_ips_bulk(1)

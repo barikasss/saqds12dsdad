@@ -93,19 +93,26 @@ def test_multi_account_rate_limit_failover():
 
 
 def test_selectel_rate_limit_error_is_raised(tmp_path):
-    """create_floating_ips_bulk raises SelectelRateLimitError on quota_exceeded."""
+    """create_floating_ips_bulk raises SelectelRateLimitError on 429."""
     import responses as resp_lib
     from src.selectel_api import SelectelClient
 
-    create_url = "https://api.selectel.ru/vpc/resell/v2/floatingips/projects/proj-1"
+    identity_url = "https://cloud.api.selcloud.ru/identity/v3/auth/tokens"
+    net_url = "https://ru-2.cloud.api.selcloud.ru/network/v2.0/floatingips"
+    nets_url = "https://ru-2.cloud.api.selcloud.ru/network/v2.0/networks"
 
     with resp_lib.RequestsMock() as rsps:
-        rsps.add(resp_lib.POST, create_url, status=429,
-                 json={"error": "quota_exceeded"})
+        rsps.add(resp_lib.POST, identity_url,
+                 json={"token": {"expires_at": "2026-12-01T00:00:00Z"}},
+                 headers={"X-Subject-Token": "ks-token"}, status=201)
+        rsps.add(resp_lib.GET, nets_url,
+                 json={"networks": [{"id": "net-1"}]},
+                 match_querystring=False)
+        rsps.add(resp_lib.POST, net_url, status=429)
 
         client = SelectelClient(
-            account_id="acc-1", api_key="key-1",
-            project_id="proj-1", region="ru-2",
+            account_id="acc-1", username="svc", password="pass",
+            api_key="key-1", project_id="proj-1", region="ru-2",
         )
         with pytest.raises(SelectelRateLimitError):
             client.create_floating_ips_bulk(1)

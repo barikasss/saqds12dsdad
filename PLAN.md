@@ -20,6 +20,16 @@
 
 ---
 
+## Архитектура API (актуально)
+
+| Операция | API | Auth | Причина |
+|---|---|---|---|
+| LIST FIPs | Resell API | X-Token | Простой endpoint, один для всех проектов |
+| CREATE FIP | OpenStack Neutron | Keystone (service user) | Нет rate limit |
+| DELETE FIP | OpenStack Neutron | Keystone (service user) | Нет rate limit |
+
+Config: каждый аккаунт требует и `api_key_env` (Resell list) и `password_env` (OpenStack create/delete).
+
 ## FUTURE (не срочно, но не забыть)
 
 - **asyncio + subprocess для ping_agent** — коллега использует этот подход для 150+ одновременных пингов. Сейчас у нас ThreadPoolExecutor(3 workers) что даёт 2.6x ускорение и этого достаточно. Переход на asyncio даст ещё ~1.5x и меньше памяти. Реализация: переписать ICMPChecker.ping_subnet на asyncio.create_subprocess_exec, ping_agent.py на asyncio.gather.

@@ -311,6 +311,7 @@ class Orchestrator:
                         account_id=a.get("account_id", ""),
                         username=a.get("username", "") or a.get("account_id", ""),
                         api_key=os.environ.get(a.get("api_key_env", ""), ""),
+                        password=os.environ.get(a.get("password_env", ""), ""),
                         project_id=a.get("project_id") or "",
                         region=a.get("availability_zone", self._zone),
                         proxy_pool=resell_proxy_pool,
@@ -321,6 +322,7 @@ class Orchestrator:
                 self._clients = [SelectelClient(
                     account_id=os.environ.get(sel.get("account_id_env", "SELECTEL_ACCOUNT_ID"), ""),
                     api_key=os.environ.get(sel.get("api_key_env", "SELECTEL_API_KEY"), ""),
+                    password=os.environ.get(sel.get("password_env", "SELECTEL_PASSWORD"), ""),
                     project_id=os.environ.get(sel.get("project_id_env", "SELECTEL_PROJECT_ID"), "") or "",
                     region=self._zone,
                     proxy_pool=resell_proxy_pool,

@@ -1,14 +1,13 @@
-# selectel_api.py — Selectel Resell API client (floating IPs)
+# selectel_api.py — Selectel API client
 #
-# Auth: X-Token: <api_key>  (from my.selectel.ru → Profile → Security → API keys)
-# Docs: https://docs.selectel.ru/api/
-#
-# Replaces OpenStack Neutron API — no Keystone auth, no network_id lookups.
+# List FIPs:    Resell API (X-Token, single endpoint)
+# Create FIPs:  OpenStack Neutron API (Keystone auth, no rate limit)
+# Delete FIPs:  OpenStack Neutron API (Keystone auth, no rate limit)
 
 from __future__ import annotations
 
 import time
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Any
 
 import requests
 import structlog
@@ -20,6 +19,10 @@ log = structlog.get_logger(__name__)
 
 _RESELL_BASE = "https://api.selectel.ru/vpc/resell/v2"
 _IDENTITY_URL = "https://cloud.api.selcloud.ru/identity/v3/auth/tokens"
+
+
+def _mask_token(token: str) -> str:
+    return token[:8] + "..." if len(token) > 8 else "***"
 
 
 def _mask_proxy(proxy_url: str) -> str:
@@ -49,27 +52,29 @@ class SelectelClient:
         self,
         account_id: str = "",
         username: str = "",
-        api_key: str = "",
+        api_key: str = "",       # X-Token for Resell list
+        password: str = "",      # service user password for OpenStack create/delete
         project_id: str = "",
         region: str = "ru-3",
         proxy_pool: "ResellProxyPool | None" = None,
     ) -> None:
         self._account_id = account_id
-        self.username = username or account_id   # public — used by AccountPool for logging
+        self.username = username or account_id
         self._api_key = api_key
+        self._password = password
         self._project_id = project_id
         self._region = region
         self._proxy_pool = proxy_pool
         self._session = requests.Session()
-        self._last_delete_time: float = 0.0
-        self._delete_interval: float = 5.0  # min seconds between deletes
+        # Keystone token cache (for OpenStack create/delete)
         self._keystone_token: str | None = None
         self._keystone_expires: float = 0.0
+        # Cached external network ID per region
+        self._network_id: str | None = None
 
     # ------------------------------------------------------------------
-
-    def _headers(self) -> dict:
-        return {"X-Token": self._api_key, "Content-Type": "application/json"}
+    # Proxy helpers
+    # ------------------------------------------------------------------
 
     def _proxies_for_request(self) -> dict | None:
         if self._proxy_pool is None:
@@ -77,104 +82,144 @@ class SelectelClient:
         proxy = self._proxy_pool.next()
         if proxy is None:
             return None
-        log.debug("selectel_resell.proxy_used",
-                  proxy=_mask_proxy(proxy), account=self.username)
+        log.debug("selectel.proxy_used", proxy=_mask_proxy(proxy),
+                  account=self.username)
         return {"http": proxy, "https": proxy}
 
-    def _request(
-        self, method: str, url: str,
-        max_retries: int = 3,
-        **kwargs,
-    ) -> requests.Response:
-        last_exc: Exception | None = None
-        for attempt in range(max(1, max_retries)):
-            proxies = self._proxies_for_request()
+    # ------------------------------------------------------------------
+    # Keystone auth (for OpenStack create/delete)
+    # ------------------------------------------------------------------
+
+    def _auth(self) -> str:
+        """Return valid Keystone X-Auth-Token, cached until ~1 min before expiry."""
+        if self._keystone_token and time.time() < self._keystone_expires:
+            return self._keystone_token
+
+        if not (self.username and self._password and self._account_id):
+            raise SelectelAPIError(
+                0,
+                "No service user credentials for OpenStack auth. "
+                "Set password_env in config.",
+            )
+
+        body: dict[str, Any] = {
+            "auth": {
+                "identity": {
+                    "methods": ["password"],
+                    "password": {
+                        "user": {
+                            "name": self.username,
+                            "domain": {"name": self._account_id},
+                            "password": self._password,
+                        }
+                    },
+                },
+                **({"scope": {"project": {"id": self._project_id}}}
+                   if self._project_id else {}),
+            }
+        }
+
+        proxies = self._proxies_for_request()
+        try:
+            resp = requests.post(
+                _IDENTITY_URL, json=body,
+                timeout=10, proxies=proxies,
+            )
+            if resp.status_code == 201:
+                token = resp.headers.get("X-Subject-Token", "")
+                if token:
+                    try:
+                        expires_str = resp.json()["token"]["expires_at"]
+                        from datetime import datetime
+                        dt = datetime.fromisoformat(
+                            expires_str.replace("Z", "+00:00"))
+                        self._keystone_expires = dt.timestamp() - 60
+                    except Exception:
+                        self._keystone_expires = time.time() + 3000
+                    self._keystone_token = token
+                    log.info("selectel.auth_ok", token=_mask_token(token))
+                    return token
+            raise SelectelAPIError(resp.status_code, resp.text)
+        except SelectelAPIError:
+            raise
+        except Exception as exc:
+            log.warning("selectel.auth_error", error=str(exc))
+            raise SelectelAPIError(0, f"Auth failed: {exc}") from exc
+
+    # ------------------------------------------------------------------
+    # OpenStack helpers (authenticated)
+    # ------------------------------------------------------------------
+
+    @property
+    def _net_base(self) -> str:
+        return f"https://{self._region}.cloud.api.selcloud.ru/network/v2.0"
+
+    def _ks_request(self, method: str, url: str, **kwargs) -> requests.Response:
+        """Authenticated OpenStack request with Keystone token."""
+        proxies = self._proxies_for_request()
+        for auth_attempt in range(2):
+            token = self._auth()
+            headers = {
+                "X-Auth-Token": token,
+                "Content-Type": "application/json",
+            }
             try:
-                resp = self._session.request(
+                resp = requests.request(
                     method, url,
-                    headers=self._headers(),
+                    headers=headers,
                     proxies=proxies,
                     timeout=(10, 30),
                     **kwargs,
                 )
-                return resp
-            except requests.exceptions.ProxyError as exc:
-                log.warning("selectel_resell.proxy_error",
-                            attempt=attempt + 1, error=str(exc))
-                last_exc = exc
-                continue
             except (requests.exceptions.ConnectionError,
                     requests.exceptions.Timeout) as exc:
-                log.warning("selectel_resell.connection_error",
-                            attempt=attempt + 1, error=str(exc))
-                last_exc = exc
-                if attempt + 1 < max_retries:
-                    time.sleep(2 ** attempt)
+                raise SelectelAPIError(0, f"OpenStack request failed: {exc}") from exc
+
+            if resp.status_code == 401 and auth_attempt == 0:
+                log.warning("selectel.ks_token_expired_retry")
+                self._keystone_token = None
+                self._keystone_expires = 0.0
                 continue
-        raise SelectelAPIError(
-            0, f"Request failed after {max_retries} retries: {last_exc}"
-        ) from last_exc
+            return resp
+        raise SelectelAPIError(401, "OpenStack auth failed after retry")
 
-    # ------------------------------------------------------------------
-    # OpenStack fallback for DELETE (no Resell rate limit)
-    # ------------------------------------------------------------------
-
-    def _get_keystone_token(self) -> str | None:
-        """Exchange X-Token for a Keystone token (for OpenStack API calls)."""
-        if self._keystone_token and time.time() < self._keystone_expires:
-            return self._keystone_token
-        try:
-            resp = requests.post(
-                _IDENTITY_URL,
-                json={"auth": {"identity": {
-                    "methods": ["token"],
-                    "token": {"id": self._api_key},
-                }}},
-                timeout=10,
-            )
-            if resp.status_code in (200, 201):
-                token = resp.headers.get("X-Subject-Token", "")
-                if token:
-                    self._keystone_token = token
-                    self._keystone_expires = time.time() + 3000
-                    log.info("selectel.keystone_token_ok")
-                    return token
-        except Exception as exc:
-            log.warning("selectel.keystone_exchange_error", error=str(exc))
-        return None
-
-    def _delete_via_openstack(self, fip_id: str) -> bool:
-        """Delete FIP via OpenStack Neutron API (no rate limiting issues)."""
-        token = self._get_keystone_token()
-        if not token:
-            return False
-        url = (f"https://{self._region}.cloud.api.selcloud.ru"
-               f"/network/v2.0/floatingips/{fip_id}")
-        try:
-            resp = requests.delete(
-                url,
-                headers={"X-Auth-Token": token},
-                timeout=(10, 30),
-            )
-            if resp.status_code in (204, 404):
-                log.info("selectel_openstack.fip_deleted", id=fip_id)
-                return True
-            log.warning("selectel_openstack.delete_failed",
-                        id=fip_id, status=resp.status_code)
-            return False
-        except Exception as exc:
-            log.warning("selectel_openstack.delete_error",
-                        id=fip_id, error=str(exc))
-            return False
+    def _get_network_id(self) -> str:
+        if self._network_id:
+            return self._network_id
+        resp = self._ks_request(
+            "GET", f"{self._net_base}/networks",
+            params={"router:external": "True"},
+        )
+        if not resp.ok:
+            raise SelectelAPIError(resp.status_code, resp.text)
+        nets = resp.json().get("networks", [])
+        if not nets:
+            raise SelectelAPIError(0, "No external networks found in region")
+        self._network_id = nets[0]["id"]
+        return self._network_id
 
     # ------------------------------------------------------------------
     # Public API
     # ------------------------------------------------------------------
 
     def list_floating_ips(self, max_conn_retries: int = 3) -> list[dict]:
-        """Return FIPs belonging to this client's project_id."""
-        resp = self._request("GET", f"{_RESELL_BASE}/floatingips",
-                             max_retries=max_conn_retries)
+        """List FIPs via Resell API (simple, single endpoint)."""
+        proxies = self._proxies_for_request()
+        for attempt in range(max(1, max_conn_retries)):
+            try:
+                resp = requests.get(
+                    f"{_RESELL_BASE}/floatingips",
+                    headers={"X-Token": self._api_key},
+                    proxies=proxies,
+                    timeout=(10, 30),
+                )
+                break
+            except (requests.exceptions.ConnectionError,
+                    requests.exceptions.Timeout) as exc:
+                if attempt + 1 >= max_conn_retries:
+                    raise SelectelAPIError(0, f"List FIPs failed: {exc}") from exc
+                time.sleep(2 ** attempt)
+                continue
         if not resp.ok:
             raise SelectelAPIError(resp.status_code, resp.text)
         fips: list[dict] = resp.json().get("floatingips", [])
@@ -183,38 +228,27 @@ class SelectelClient:
         return fips
 
     def create_floating_ips_bulk(self, quantity: int) -> list[dict]:
-        """Create `quantity` FIPs in one request.
-
-        Returns list of dicts: [{id, floating_ip_address, region, status, project_id}].
-        Raises SelectelRateLimitError on quota_exceeded.
-        """
+        """Create `quantity` FIPs via OpenStack (no rate limit, individual calls)."""
         if quantity <= 0:
             return []
-
-        resp = self._request(
-            "POST",
-            f"{_RESELL_BASE}/floatingips/projects/{self._project_id}",
-            json={"floatingips": [{"region": self._region, "quantity": quantity}]},
-        )
-
-        if resp.status_code in (429, 409):
-            try:
-                if resp.json().get("error") == "quota_exceeded":
-                    raise SelectelRateLimitError(resp.status_code, resp.text)
-            except (ValueError, SelectelRateLimitError):
-                raise
-            except Exception:
-                pass
-
-        if not resp.ok:
-            raise SelectelAPIError(resp.status_code, resp.text)
-
-        body = resp.json()
-        fips: list[dict] = body.get("floatingips", [])
-        for fip in fips:
-            log.info("selectel_resell.fip_created",
-                     id=fip.get("id"), ip=fip.get("floating_ip_address"),
-                     region=fip.get("region"), account=self.username)
+        network_id = self._get_network_id()
+        fips = []
+        for _ in range(quantity):
+            resp = self._ks_request(
+                "POST", f"{self._net_base}/floatingips",
+                json={"floatingip": {"floating_network_id": network_id}},
+            )
+            if resp.status_code == 429:
+                raise SelectelRateLimitError(429, resp.text)
+            if not resp.ok:
+                raise SelectelAPIError(resp.status_code, resp.text)
+            fip = resp.json()["floatingip"]
+            # Normalize to match Resell response format
+            fip.setdefault("region", self._region)
+            log.info("selectel.fip_created",
+                     id=fip["id"], ip=fip.get("floating_ip_address"),
+                     region=self._region, account=self.username)
+            fips.append(fip)
         return fips
 
     def create_floating_ip_safe(
@@ -222,27 +256,18 @@ class SelectelClient:
         network_id: str | None = None,
         availability_zone: str | None = None,
     ) -> dict:
-        """Single FIP — thin wrapper for backward compat with _DryRunClient."""
+        """Single FIP — wrapper for _DryRunClient compat."""
         fips = self.create_floating_ips_bulk(1)
         if not fips:
-            raise SelectelAPIError(0, "No FIPs returned from bulk create")
+            raise SelectelAPIError(0, "No FIPs returned")
         return fips[0]
 
     def delete_floating_ip(self, fip_id: str) -> bool:
-        # Enforce minimum interval between deletes to avoid Resell burst limit
-        elapsed = time.time() - self._last_delete_time
-        if elapsed < self._delete_interval:
-            time.sleep(self._delete_interval - elapsed)
-
-        resp = self._request("DELETE", f"{_RESELL_BASE}/floatingips/{fip_id}")
-        self._last_delete_time = time.time()
-
+        """Delete FIP via OpenStack (no burst rate limit)."""
+        resp = self._ks_request(
+            "DELETE", f"{self._net_base}/floatingips/{fip_id}",
+        )
         if resp.status_code in (204, 404):
-            log.info("selectel_resell.fip_deleted", id=fip_id)
+            log.info("selectel.fip_deleted", id=fip_id)
             return True
-
-        if resp.status_code == 429:
-            log.warning("selectel_resell.delete_rate_limit_fallback", fip_id=fip_id)
-            return self._delete_via_openstack(fip_id)
-
         raise SelectelAPIError(resp.status_code, resp.text)
