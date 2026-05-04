@@ -267,7 +267,16 @@ class SelectelClient:
             futures = [pool.submit(self._create_one_fip, network_id)
                        for _ in range(quantity)]
             for future in as_completed(futures):
-                result = future.result()  # propagates SelectelRateLimitError/SelectelAPIError
+                try:
+                    result = future.result()
+                except SelectelRateLimitError:
+                    raise  # account-level limit — propagate so AccountPool blocks
+                except SelectelAPIError as exc:
+                    if exc.status != 0:
+                        raise  # real API error — propagate
+                    log.warning("selectel.fip_thread_conn_error",
+                                account=self.username, error=str(exc))
+                    continue  # proxy connection failure — collect results from others
                 if result is not None:
                     fips.append(result)
         return fips
