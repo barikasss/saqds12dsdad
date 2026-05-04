@@ -7,6 +7,7 @@
 from __future__ import annotations
 
 import time
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from typing import TYPE_CHECKING, Any
 
 import requests
@@ -236,37 +237,39 @@ class SelectelClient:
             return fips
         raise SelectelAPIError(403, f"list_floating_ips: all {max_attempts} proxy attempts got 403")
 
+    def _create_one_fip(self, network_id: str) -> dict | None:
+        """Create a single FIP; returns fip dict or None on ExternalIpAddressExhausted."""
+        resp = self._ks_request(
+            "POST", f"{self._net_base}/floatingips",
+            json={"floatingip": {"floating_network_id": network_id}},
+        )
+        if resp.status_code == 429:
+            raise SelectelRateLimitError(429, resp.text)
+        if resp.status_code == 400 and "ExternalIpAddressExhausted" in resp.text:
+            log.warning("selectel.exhausted", account=self.username)
+            return None
+        if not resp.ok:
+            raise SelectelAPIError(resp.status_code, resp.text)
+        fip = resp.json()["floatingip"]
+        fip.setdefault("region", self._region)
+        log.info("selectel.fip_created",
+                 id=fip["id"], ip=fip.get("floating_ip_address"),
+                 region=self._region, account=self.username)
+        return fip
+
     def create_floating_ips_bulk(self, quantity: int) -> list[dict]:
-        """Create `quantity` FIPs via OpenStack (no rate limit, individual calls)."""
+        """Create `quantity` FIPs in parallel via OpenStack."""
         if quantity <= 0:
             return []
         network_id = self._get_network_id()
-        fips = []
-        consecutive_exhausted = 0
-        for _ in range(quantity):
-            resp = self._ks_request(
-                "POST", f"{self._net_base}/floatingips",
-                json={"floatingip": {"floating_network_id": network_id}},
-            )
-            if resp.status_code == 429:
-                raise SelectelRateLimitError(429, resp.text)
-            if resp.status_code == 400 and "ExternalIpAddressExhausted" in resp.text:
-                consecutive_exhausted += 1
-                if consecutive_exhausted >= 3:
-                    raise SelectelAPIError(resp.status_code, resp.text)
-                log.warning("selectel.exhausted_rotate_proxy",
-                            account=self.username, attempt=consecutive_exhausted)
-                continue  # _ks_request rotates proxy on next call
-            if not resp.ok:
-                raise SelectelAPIError(resp.status_code, resp.text)
-            consecutive_exhausted = 0
-            fip = resp.json()["floatingip"]
-            # Normalize to match Resell response format
-            fip.setdefault("region", self._region)
-            log.info("selectel.fip_created",
-                     id=fip["id"], ip=fip.get("floating_ip_address"),
-                     region=self._region, account=self.username)
-            fips.append(fip)
+        fips: list[dict] = []
+        with ThreadPoolExecutor(max_workers=quantity) as pool:
+            futures = [pool.submit(self._create_one_fip, network_id)
+                       for _ in range(quantity)]
+            for future in as_completed(futures):
+                result = future.result()  # propagates SelectelRateLimitError/SelectelAPIError
+                if result is not None:
+                    fips.append(result)
         return fips
 
     def create_floating_ip_safe(
