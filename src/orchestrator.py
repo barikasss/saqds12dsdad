@@ -365,6 +365,11 @@ class Orchestrator:
             if self._dead_subnets:
                 log.info("orch.dead_cache_loaded", count=len(self._dead_subnets))
 
+        # FIPs that can't be deleted (e.g. created via OpenStack, undeletable via Resell API)
+        # After MAX_DELETE_FAILURES attempts, stop trying and accept slot is lost.
+        self._delete_failures: dict[str, int] = {}
+        self._MAX_DELETE_FAILURES = 5
+
         nt = cfg.get("notifier", {}).get("telegram", {})
         tg_token = os.environ.get(nt.get("bot_token_env", "TG_BOT_TOKEN"), "")
         tg_chat = os.environ.get(nt.get("chat_id_env", "TG_CHAT_ID"), "")
@@ -590,23 +595,6 @@ class Orchestrator:
                         datetime.now(timezone.utc) + timedelta(seconds=60),
                     )
                 continue
-
-            # Delete orphan FIPs — exist on Selectel but not tracked in pending_tasks
-            # These are zombies from failed deletes that block quota slots.
-            pending_ids = {t.fip_id for t in self._pending_tasks
-                           if t.account == client.username}
-            orphans = [f for f in existing if f.get("id") not in pending_ids]
-            if orphans:
-                log.info("orch.orphan_fips_found",
-                         account=client.username, count=len(orphans))
-                for fip in orphans:
-                    self._safe_delete(client, fip["id"])
-                # Re-list to get accurate count after deletions
-                try:
-                    existing = client.list_floating_ips()
-                    fips_count = len(existing)
-                except Exception:
-                    pass
 
             quantity = MAX_FIPS_PER_ACCOUNT - fips_count
             if quantity <= 0 or not self._running:
