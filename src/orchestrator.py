@@ -601,7 +601,12 @@ class Orchestrator:
                          account=client.username, count=len(orphans))
                 for fip in orphans:
                     self._safe_delete(client, fip["id"])
-                    fips_count -= 1
+                # Re-list to get accurate count after deletions
+                try:
+                    existing = client.list_floating_ips()
+                    fips_count = len(existing)
+                except Exception:
+                    pass
 
             quantity = MAX_FIPS_PER_ACCOUNT - fips_count
             if quantity <= 0 or not self._running:
