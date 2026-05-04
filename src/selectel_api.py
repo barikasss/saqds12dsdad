@@ -172,8 +172,15 @@ class SelectelClient:
         return fips[0]
 
     def delete_floating_ip(self, fip_id: str) -> bool:
-        resp = self._request("DELETE", f"{_RESELL_BASE}/floatingips/{fip_id}")
-        if resp.status_code in (204, 404):
-            log.info("selectel_resell.fip_deleted", id=fip_id)
-            return True
-        raise SelectelAPIError(resp.status_code, resp.text)
+        for attempt in range(3):
+            resp = self._request("DELETE", f"{_RESELL_BASE}/floatingips/{fip_id}")
+            if resp.status_code in (204, 404):
+                log.info("selectel_resell.fip_deleted", id=fip_id)
+                return True
+            if resp.status_code == 429:
+                log.warning("selectel_resell.delete_rate_limit",
+                            fip_id=fip_id, attempt=attempt + 1)
+                time.sleep(2 ** attempt)
+                continue
+            raise SelectelAPIError(resp.status_code, resp.text)
+        raise SelectelAPIError(429, f"delete rate limited after 3 retries: {fip_id}")

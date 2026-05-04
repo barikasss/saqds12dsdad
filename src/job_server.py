@@ -114,6 +114,15 @@ def enqueue_job(req: EnqueueRequest, _: Auth) -> None:
     enqueue(req.cidr)
 
 
+@app.post("/reset", status_code=204)
+def reset_jobs(_: Auth) -> None:
+    """Clear all pending jobs and results (called by orchestrator on startup)."""
+    with _lock:
+        _pending_jobs.clear()
+        _results.clear()
+    log.info("job_server.reset")
+
+
 @app.get("/ping-results")
 def get_ping_result(cidr: str, _: Auth) -> dict:
     """Return alive count for a CIDR if result is ready, else 404."""

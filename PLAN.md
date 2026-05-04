@@ -20,6 +20,12 @@
 
 ---
 
+## FUTURE (не срочно, но не забыть)
+
+- **asyncio + subprocess для ping_agent** — коллега использует этот подход для 150+ одновременных пингов. Сейчас у нас ThreadPoolExecutor(3 workers) что даёт 2.6x ускорение и этого достаточно. Переход на asyncio даст ещё ~1.5x и меньше памяти. Реализация: переписать ICMPChecker.ping_subnet на asyncio.create_subprocess_exec, ping_agent.py на asyncio.gather.
+
+---
+
 ## Баги и улучшения (очередь)
 
 | Приоритет | Проблема | Решение |

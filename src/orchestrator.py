@@ -236,6 +236,13 @@ class PingAgentClient:
             log.warning("ping_client.result_error", cidr=cidr, error=str(exc))
             return None
 
+    def reset_jobs(self) -> None:
+        try:
+            self._session.post(f"{self.url}/reset", headers=self._headers, timeout=5)
+            log.info("ping_client.jobs_reset")
+        except Exception as exc:
+            log.warning("ping_client.reset_error", error=str(exc))
+
 
 # ---------------------------------------------------------------------------
 # Orchestrator
@@ -378,6 +385,7 @@ class Orchestrator:
                 timeout_seconds=pa_cfg.get("timeout_seconds", 60),
             )
             log.info("orch.ping_agent_enabled", url=self._ping_client.url)
+            self._ping_client.reset_jobs()
         else:
             self._ping_client = None
 
@@ -498,6 +506,13 @@ class Orchestrator:
 
                 subnet = ip_to_cidr24(ip)
                 if self.filter.is_ip_in_whitelist(ip):
+                    # Skip FIPs in known-dead subnets — delete instead of reclaim
+                    if subnet in self._dead_subnets:
+                        self._safe_delete(client, fip_id)
+                        log.info("orch.cleanup_dead_subnet", ip=ip, subnet=subnet,
+                                 account=client.username)
+                        deleted += 1
+                        continue
                     already = any(t.fip_id == fip_id for t in self._pending_tasks)
                     if not already:
                         task = SubnetTask(
