@@ -233,9 +233,12 @@ def test_max_fips_limit(write_config):
     fake._region = "ru-2"
     fake.list_floating_ips.return_value = []
     fake.create_floating_ips_bulk.return_value = [
-        {"id": f"f-{i}", "floating_ip_address": "10.0.0.10"}
+        {"id": f"f-{i}", "floating_ip_address": f"10.0.{i}.10"}
         for i in range(MAX_FIPS_PER_ACCOUNT)
     ]
+    # Each IP is in a separate /24 — patch filter to pass all of them
+    orch.filter = MagicMock()
+    orch.filter.is_ip_in_whitelist.return_value = True
     fake.delete_floating_ip.return_value = True
 
     orch._clients = [fake]

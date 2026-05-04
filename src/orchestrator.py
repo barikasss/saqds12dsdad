@@ -667,6 +667,11 @@ class Orchestrator:
                     log.info("orch.skipped_dead_subnet", ip=ip, subnet=subnet)
                     continue
 
+                if any(t.cidr == subnet for t in self._pending_tasks):
+                    self._safe_delete(client, fip["id"])
+                    log.info("orch.fip_duplicate_subnet", ip=ip, subnet=subnet)
+                    continue
+
                 task = SubnetTask(
                     cidr=subnet,
                     fip_id=fip["id"],
@@ -745,11 +750,13 @@ class Orchestrator:
                                  cidr=task.cidr, alive=alive, total=len(res))
 
         # Step 2 — WL retry for tasks where pool was exhausted at create time
+        submitted_cidrs: set[str] = {t.cidr for t in self._pending_tasks if t.wl_job_id is not None}
         for task in self._pending_tasks:
-            if task.wl_job_id is None:
+            if task.wl_job_id is None and task.cidr not in submitted_cidrs:
                 got = self.wl_pool.submit(task.cidr)
                 if got is not None:
                     task.wl_job_id, task.wl_key = got
+                    submitted_cidrs.add(task.cidr)
 
         # Step 3 — Poll WL results
         for task in self._pending_tasks:
