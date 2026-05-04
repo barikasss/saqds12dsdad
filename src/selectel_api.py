@@ -19,6 +19,7 @@ if TYPE_CHECKING:
 log = structlog.get_logger(__name__)
 
 _RESELL_BASE = "https://api.selectel.ru/vpc/resell/v2"
+_IDENTITY_URL = "https://cloud.api.selcloud.ru/identity/v3/auth/tokens"
 
 
 def _mask_proxy(proxy_url: str) -> str:
@@ -62,6 +63,8 @@ class SelectelClient:
         self._session = requests.Session()
         self._last_delete_time: float = 0.0
         self._delete_interval: float = 5.0  # min seconds between deletes
+        self._keystone_token: str | None = None
+        self._keystone_expires: float = 0.0
 
     # ------------------------------------------------------------------
 
@@ -111,6 +114,58 @@ class SelectelClient:
         raise SelectelAPIError(
             0, f"Request failed after {max_retries} retries: {last_exc}"
         ) from last_exc
+
+    # ------------------------------------------------------------------
+    # OpenStack fallback for DELETE (no Resell rate limit)
+    # ------------------------------------------------------------------
+
+    def _get_keystone_token(self) -> str | None:
+        """Exchange X-Token for a Keystone token (for OpenStack API calls)."""
+        if self._keystone_token and time.time() < self._keystone_expires:
+            return self._keystone_token
+        try:
+            resp = requests.post(
+                _IDENTITY_URL,
+                json={"auth": {"identity": {
+                    "methods": ["token"],
+                    "token": {"id": self._api_key},
+                }}},
+                timeout=10,
+            )
+            if resp.status_code in (200, 201):
+                token = resp.headers.get("X-Subject-Token", "")
+                if token:
+                    self._keystone_token = token
+                    self._keystone_expires = time.time() + 3000
+                    log.info("selectel.keystone_token_ok")
+                    return token
+        except Exception as exc:
+            log.warning("selectel.keystone_exchange_error", error=str(exc))
+        return None
+
+    def _delete_via_openstack(self, fip_id: str) -> bool:
+        """Delete FIP via OpenStack Neutron API (no rate limiting issues)."""
+        token = self._get_keystone_token()
+        if not token:
+            return False
+        url = (f"https://{self._region}.cloud.api.selcloud.ru"
+               f"/network/v2.0/floatingips/{fip_id}")
+        try:
+            resp = requests.delete(
+                url,
+                headers={"X-Auth-Token": token},
+                timeout=(10, 30),
+            )
+            if resp.status_code in (204, 404):
+                log.info("selectel_openstack.fip_deleted", id=fip_id)
+                return True
+            log.warning("selectel_openstack.delete_failed",
+                        id=fip_id, status=resp.status_code)
+            return False
+        except Exception as exc:
+            log.warning("selectel_openstack.delete_error",
+                        id=fip_id, error=str(exc))
+            return False
 
     # ------------------------------------------------------------------
     # Public API
@@ -174,22 +229,20 @@ class SelectelClient:
         return fips[0]
 
     def delete_floating_ip(self, fip_id: str) -> bool:
-        # Enforce minimum interval between deletes to avoid Selectel burst limit
+        # Enforce minimum interval between deletes to avoid Resell burst limit
         elapsed = time.time() - self._last_delete_time
         if elapsed < self._delete_interval:
             time.sleep(self._delete_interval - elapsed)
 
-        for attempt in range(4):
-            resp = self._request("DELETE", f"{_RESELL_BASE}/floatingips/{fip_id}")
-            self._last_delete_time = time.time()
-            if resp.status_code in (204, 404):
-                log.info("selectel_resell.fip_deleted", id=fip_id)
-                return True
-            if resp.status_code == 429:
-                wait = 10 * (2 ** attempt)  # 10s, 20s, 40s, 80s
-                log.warning("selectel_resell.delete_rate_limit",
-                            fip_id=fip_id, attempt=attempt + 1, wait=wait)
-                time.sleep(wait)
-                continue
-            raise SelectelAPIError(resp.status_code, resp.text)
-        raise SelectelAPIError(429, f"delete rate limited after 4 retries: {fip_id}")
+        resp = self._request("DELETE", f"{_RESELL_BASE}/floatingips/{fip_id}")
+        self._last_delete_time = time.time()
+
+        if resp.status_code in (204, 404):
+            log.info("selectel_resell.fip_deleted", id=fip_id)
+            return True
+
+        if resp.status_code == 429:
+            log.warning("selectel_resell.delete_rate_limit_fallback", fip_id=fip_id)
+            return self._delete_via_openstack(fip_id)
+
+        raise SelectelAPIError(resp.status_code, resp.text)
