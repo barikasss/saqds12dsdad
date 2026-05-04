@@ -60,6 +60,8 @@ class SelectelClient:
         self._region = region
         self._proxy_pool = proxy_pool
         self._session = requests.Session()
+        self._last_delete_time: float = 0.0
+        self._delete_interval: float = 5.0  # min seconds between deletes
 
     # ------------------------------------------------------------------
 
@@ -172,15 +174,22 @@ class SelectelClient:
         return fips[0]
 
     def delete_floating_ip(self, fip_id: str) -> bool:
-        for attempt in range(3):
+        # Enforce minimum interval between deletes to avoid Selectel burst limit
+        elapsed = time.time() - self._last_delete_time
+        if elapsed < self._delete_interval:
+            time.sleep(self._delete_interval - elapsed)
+
+        for attempt in range(4):
             resp = self._request("DELETE", f"{_RESELL_BASE}/floatingips/{fip_id}")
+            self._last_delete_time = time.time()
             if resp.status_code in (204, 404):
                 log.info("selectel_resell.fip_deleted", id=fip_id)
                 return True
             if resp.status_code == 429:
+                wait = 10 * (2 ** attempt)  # 10s, 20s, 40s, 80s
                 log.warning("selectel_resell.delete_rate_limit",
-                            fip_id=fip_id, attempt=attempt + 1)
-                time.sleep(2 ** attempt)
+                            fip_id=fip_id, attempt=attempt + 1, wait=wait)
+                time.sleep(wait)
                 continue
             raise SelectelAPIError(resp.status_code, resp.text)
-        raise SelectelAPIError(429, f"delete rate limited after 3 retries: {fip_id}")
+        raise SelectelAPIError(429, f"delete rate limited after 4 retries: {fip_id}")
