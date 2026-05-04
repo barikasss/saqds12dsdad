@@ -156,8 +156,8 @@ class SelectelClient:
 
     def _ks_request(self, method: str, url: str, **kwargs) -> requests.Response:
         """Authenticated OpenStack request with Keystone token."""
-        proxies = self._proxies_for_request()
-        for auth_attempt in range(2):
+        for attempt in range(3):
+            proxies = self._proxies_for_request()  # rotate proxy on each attempt
             token = self._auth()
             headers = {
                 "X-Auth-Token": token,
@@ -175,13 +175,17 @@ class SelectelClient:
                     requests.exceptions.Timeout) as exc:
                 raise SelectelAPIError(0, f"OpenStack request failed: {exc}") from exc
 
-            if resp.status_code == 401 and auth_attempt == 0:
+            if resp.status_code == 401 and attempt < 2:
                 log.warning("selectel.ks_token_expired_retry")
                 self._keystone_token = None
                 self._keystone_expires = 0.0
                 continue
+            if resp.status_code == 403 and attempt < 2:
+                log.warning("selectel.ks_403_rotate_proxy",
+                            account=self.username, attempt=attempt)
+                continue
             return resp
-        raise SelectelAPIError(401, "OpenStack auth failed after retry")
+        raise SelectelAPIError(403, "OpenStack: all proxy attempts got 403")
 
     def _get_network_id(self) -> str:
         if self._network_id:
@@ -204,8 +208,9 @@ class SelectelClient:
 
     def list_floating_ips(self, max_conn_retries: int = 3) -> list[dict]:
         """List FIPs via Resell API (simple, single endpoint)."""
-        proxies = self._proxies_for_request()
-        for attempt in range(max(1, max_conn_retries)):
+        max_attempts = max(1, max_conn_retries)
+        for attempt in range(max_attempts):
+            proxies = self._proxies_for_request()  # rotate proxy on each attempt
             try:
                 resp = requests.get(
                     f"{_RESELL_BASE}/floatingips",
@@ -213,19 +218,23 @@ class SelectelClient:
                     proxies=proxies,
                     timeout=(10, 30),
                 )
-                break
             except (requests.exceptions.ConnectionError,
                     requests.exceptions.Timeout) as exc:
-                if attempt + 1 >= max_conn_retries:
+                if attempt + 1 >= max_attempts:
                     raise SelectelAPIError(0, f"List FIPs failed: {exc}") from exc
                 time.sleep(2 ** attempt)
                 continue
-        if not resp.ok:
-            raise SelectelAPIError(resp.status_code, resp.text)
-        fips: list[dict] = resp.json().get("floatingips", [])
-        if self._project_id:
-            fips = [f for f in fips if f.get("project_id") == self._project_id]
-        return fips
+            if resp.status_code == 403 and attempt + 1 < max_attempts:
+                log.warning("selectel.resell_403_rotate_proxy",
+                            account=self.username, attempt=attempt)
+                continue
+            if not resp.ok:
+                raise SelectelAPIError(resp.status_code, resp.text)
+            fips: list[dict] = resp.json().get("floatingips", [])
+            if self._project_id:
+                fips = [f for f in fips if f.get("project_id") == self._project_id]
+            return fips
+        raise SelectelAPIError(403, f"list_floating_ips: all {max_attempts} proxy attempts got 403")
 
     def create_floating_ips_bulk(self, quantity: int) -> list[dict]:
         """Create `quantity` FIPs via OpenStack (no rate limit, individual calls)."""

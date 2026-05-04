@@ -20,17 +20,23 @@ Always use `.venv/bin/python`, never system python or bare `pytest`.
 .venv/bin/python -m pytest -x --tb=short                # stop on first fail
 
 # Run the orchestrator
-python -m src.orchestrator --dry-run                    # no Selectel writes
-python -m src.orchestrator                              # real run
-python -m src.orchestrator --no-icmp                    # skip local ICMP (required in WSL/Termux)
+.venv/bin/python -m src.orchestrator --dry-run          # no Selectel writes
+.venv/bin/python -m src.orchestrator                    # real run
+.venv/bin/python -m src.orchestrator --no-icmp          # skip local ICMP (required in WSL/Termux)
+
+# Split-branch: job server (runs on VM, receives ping jobs from Samsung)
+uvicorn src.job_server:app --host 0.0.0.0 --port 8888
+
+# Split-branch: Samsung ping agent (runs on Termux, polls job server)
+.venv/bin/python ping_agent.py
 
 # Subnet pool maintenance
-python -m src.subnet_source --refresh                   # refresh RIPE AS49505 cache
-python -m src.subnet_source --stats                     # pool stats
+.venv/bin/python -m src.subnet_source --refresh         # refresh RIPE AS49505 cache
+.venv/bin/python -m src.subnet_source --stats           # pool stats
 
 # Other tools
-python -m src.subnet_filter --check 87.228.90.5         # whitelist lookup
-python -m src.notifier --test "ping"                    # test Telegram delivery
+.venv/bin/python -m src.subnet_filter --check 87.228.90.5  # whitelist lookup
+.venv/bin/python -m src.notifier --test "ping"          # test Telegram delivery
 ```
 
 ## Configuration
@@ -75,8 +81,8 @@ The main loop is `src/orchestrator.py:Orchestrator.run`, which runs three phases
 
 ## Branches
 
-- `beta` — current working branch (this codebase)
-- `split` — in development; see `PLAN.md` for 9-step implementation plan. Adds: ProxyPool (18 SOCKS5 proxies), dead subnet cache, parallel ICMP+WL, OR logic, never-stop mode, FastAPI job server on VM, `ping_agent.py` for Samsung
+- `split` — current branch; all 9 PLAN.md steps implemented. Adds over `beta`: ProxyPool (18 SOCKS5 proxies), dead subnet cache, parallel ICMP+WL, OR logic, never-stop mode, FastAPI job server (`src/job_server.py`) on VM, `ping_agent.py` for Samsung. `VM_URL` and `PING_AGENT_SECRET` env vars required.
+- `beta` — previous stable branch (single-account, no ProxyPool, no job server)
 
 ## WSL-specific notes
 
