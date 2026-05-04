@@ -152,6 +152,7 @@ class SelectelClient:
         if not resp.ok:
             raise SelectelAPIError(resp.status_code, resp.text)
 
+        body = resp.json()
         fips: list[dict] = body.get("floatingips", [])
         for fip in fips:
             log.info("selectel_resell.fip_created",

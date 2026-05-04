@@ -134,8 +134,8 @@ def test_create_bulk_quota_exceeded_429():
 
 @resp_lib.activate
 def test_create_bulk_quota_exceeded_in_body():
-    """quota_exceeded can come in 200 body too."""
-    resp_lib.add(resp_lib.POST, CREATE_URL, status=200,
+    """quota_exceeded comes as 409."""
+    resp_lib.add(resp_lib.POST, CREATE_URL, status=409,
                  json={"error": "quota_exceeded", "quotas": {}})
 
     client = make_client()
