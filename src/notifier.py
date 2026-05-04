@@ -188,6 +188,7 @@ class TelegramNotifier:
             f"✅ Белых: {e(str(stats.get('white_found', '?')))}\n"
             f"❌ Не в списке: {e(str(stats.get('deleted_not_in_whitelist', '?')))}\n"
             f"💀 Мёртвых: {e(str(stats.get('dead', '?')))}\n"
+            f"⏩ Пропущено (dead cache): {e(str(stats.get('skipped_dead_subnet', 0)))}\n"
             f"⏱ {e(str(stats.get('elapsed', '?')))}\n"
             f"{accounts_str}"
         )
