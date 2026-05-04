@@ -62,6 +62,34 @@ class ProxyPool:
         proxies = [p.strip() for p in env_value.split(",") if p.strip()]
         return ProxyPool(proxies=proxies, cooldown_seconds=cooldown_seconds)
 
+    @staticmethod
+    def from_file(path: str, cooldown_seconds: int = 0) -> "ProxyPool":
+        """Build ProxyPool from a file with one proxy URL per line."""
+        from pathlib import Path
+        lines = Path(path).read_text().splitlines()
+        proxies = [l.strip() for l in lines if l.strip() and not l.startswith("#")]
+        return ProxyPool(proxies=proxies, cooldown_seconds=cooldown_seconds)
+
+
+class ResellProxyPool:
+    """Simple round-robin proxy pool for Resell API — no cooldown, rotates on every call."""
+
+    def __init__(self, proxy_urls: list[str]) -> None:
+        self.proxy_urls = list(proxy_urls)
+        self._idx = 0
+
+    def next(self) -> str | None:
+        if not self.proxy_urls:
+            return None
+        proxy = self.proxy_urls[self._idx % len(self.proxy_urls)]
+        self._idx += 1
+        return proxy
+
+    @staticmethod
+    def from_env(env_value: str) -> "ResellProxyPool":
+        proxies = [p.strip() for p in env_value.split(",") if p.strip()]
+        return ResellProxyPool(proxy_urls=proxies)
+
 
 def _mask(proxy_url: str) -> str:
     """Hide credentials in proxy URL for logging."""

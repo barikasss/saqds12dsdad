@@ -208,11 +208,7 @@ def test_not_in_whitelist_delete(write_config):
     fake.username = "fake"
     fake._region = "ru-2"
     fake.list_floating_ips.return_value = []
-    # First call yields a non-whitelist FIP, second raises rate-limit so we stop
-    fake.create_floating_ip_safe.side_effect = [
-        bad_fip,
-        SelectelRateLimitError(429, "stop"),
-    ]
+    fake.create_floating_ips_bulk.return_value = [bad_fip]
     fake.delete_floating_ip.return_value = True
 
     orch._clients = [fake]
@@ -232,17 +228,14 @@ def test_not_in_whitelist_delete(write_config):
 def test_max_fips_limit(write_config):
     orch = Orchestrator(config_path=write_config, dry_run=True)
 
-    counter = {"i": 0}
-
-    def make_fip(network_id=None, availability_zone=None):
-        counter["i"] += 1
-        return {"id": f"f-{counter['i']}", "floating_ip_address": "10.0.0.10"}
-
     fake = MagicMock()
     fake.username = "fake"
     fake._region = "ru-2"
     fake.list_floating_ips.return_value = []
-    fake.create_floating_ip_safe.side_effect = make_fip
+    fake.create_floating_ips_bulk.return_value = [
+        {"id": f"f-{i}", "floating_ip_address": "10.0.0.10"}
+        for i in range(MAX_FIPS_PER_ACCOUNT)
+    ]
     fake.delete_floating_ip.return_value = True
 
     orch._clients = [fake]
@@ -250,7 +243,7 @@ def test_max_fips_limit(write_config):
 
     orch._create_phase()
 
-    assert fake.create_floating_ip_safe.call_count == MAX_FIPS_PER_ACCOUNT
+    fake.create_floating_ips_bulk.assert_called_once_with(MAX_FIPS_PER_ACCOUNT)
     assert len(orch._pending_tasks) == MAX_FIPS_PER_ACCOUNT
 
 
@@ -319,10 +312,7 @@ def test_dead_subnet_skipped_in_create_phase(write_config, tmp_path):
     fake.username = "fake"
     fake._region = "ru-2"
     fake.list_floating_ips.return_value = []
-    fake.create_floating_ip_safe.side_effect = [
-        dead_fip,
-        SelectelRateLimitError(429, "stop"),
-    ]
+    fake.create_floating_ips_bulk.return_value = [dead_fip]
     fake.delete_floating_ip.return_value = True
 
     orch._clients = [fake]

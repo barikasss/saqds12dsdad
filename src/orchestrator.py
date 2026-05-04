@@ -25,7 +25,7 @@ from src.checkers.icmp_checker import ICMPChecker
 from src.checkers.wl_pool import WLKeyPool
 from src.config import load_config
 from src.notifier import TelegramNotifier
-from src.proxy_pool import ProxyPool
+from src.proxy_pool import ResellProxyPool
 from src.selectel_api import SelectelAPIError, SelectelClient, SelectelRateLimitError
 from src.subnet_filter import SubnetFilter
 from src.subnet_source import SubnetSource, _atomic_write
@@ -141,22 +141,34 @@ class _DryRunClient:
     def list_external_networks(self) -> list[dict]:
         return [{"id": "dry-network"}]
 
+    def create_floating_ips_bulk(
+        self,
+        quantity: int,
+    ) -> list[dict]:
+        if quantity <= 0:
+            return []
+        if not self._subnets:
+            raise SelectelRateLimitError(429, "dry-run: no priority subnets configured")
+        fips = []
+        for _ in range(quantity):
+            self._counter += 1
+            subnet = self._subnets[self._counter % len(self._subnets)]
+            net = ipaddress.ip_network(subnet, strict=False)
+            host = random.choice(list(net.hosts()))
+            fip_id = f"dry-{self.username}-{self._counter}"
+            fip = {"id": fip_id, "floating_ip_address": str(host), "region": self._region}
+            self._allocated[fip_id] = fip
+            log.info("dryrun.fip_created", id=fip_id, ip=str(host), account=self.username)
+            fips.append(fip)
+        return fips
+
     def create_floating_ip_safe(
         self,
         network_id: str | None = None,
         availability_zone: str | None = None,
     ) -> dict:
-        if not self._subnets:
-            raise SelectelRateLimitError(429, "dry-run: no priority subnets configured")
-        self._counter += 1
-        subnet = self._subnets[self._counter % len(self._subnets)]
-        net = ipaddress.ip_network(subnet, strict=False)
-        host = random.choice(list(net.hosts()))
-        fip_id = f"dry-{self.username}-{self._counter}"
-        fip = {"id": fip_id, "floating_ip_address": str(host)}
-        self._allocated[fip_id] = fip
-        log.info("dryrun.fip_created", id=fip_id, ip=str(host), account=self.username)
-        return fip
+        fips = self.create_floating_ips_bulk(1)
+        return fips[0]
 
     def delete_floating_ip(self, fip_id: str) -> bool:
         self._allocated.pop(fip_id, None)
@@ -271,12 +283,12 @@ class Orchestrator:
         sr = cfg.get("search", {})
         priority: list[str] = sr.get("priority_subnets", [])
 
-        # Shared proxy pool for create_floating_ip_safe (split branch)
-        proxies_env = os.environ.get("SELECTEL_PROXIES", "").strip()
-        proxy_cooldown = int(os.environ.get("SELECTEL_PROXY_COOLDOWN", "0"))
-        proxy_pool = ProxyPool.from_env(proxies_env, cooldown_seconds=proxy_cooldown) if proxies_env else None
-        if proxy_pool:
-            log.info("orch.proxy_pool_loaded", count=len(proxy_pool.proxies))
+        # Resell proxy pool — round-robin, one proxy per request
+        resell_proxies_env = os.environ.get("RESELL_PROXY_URLS", "").strip()
+        resell_proxy_pool = ResellProxyPool.from_env(resell_proxies_env)
+        if resell_proxy_pool.proxy_urls:
+            log.info("orch.resell_proxy_pool_loaded",
+                     count=len(resell_proxy_pool.proxy_urls))
 
         if self.dry_run:
             self._clients = [
@@ -286,29 +298,25 @@ class Orchestrator:
         else:
             accounts_cfg: list[dict] = cfg.get("selectel_accounts", [])
             enabled = [a for a in accounts_cfg if a.get("enabled", True)]
-            _default_proxy = os.environ.get("SELECTEL_PROXY_URL") or None
             if enabled:
                 self._clients = [
                     SelectelClient(
                         account_id=a.get("account_id", ""),
-                        username=a.get("username", ""),
-                        password=os.environ.get(a.get("password_env", ""), ""),
-                        project_id=a.get("project_id") or None,
+                        username=a.get("username", "") or a.get("account_id", ""),
+                        api_key=os.environ.get(a.get("api_key_env", ""), ""),
+                        project_id=a.get("project_id") or "",
                         region=a.get("availability_zone", self._zone),
-                        proxy_url=a.get("proxy_url") or _default_proxy,
-                        proxy_pool=proxy_pool,
+                        proxy_pool=resell_proxy_pool,
                     )
                     for a in enabled
                 ]
             else:
                 self._clients = [SelectelClient(
                     account_id=os.environ.get(sel.get("account_id_env", "SELECTEL_ACCOUNT_ID"), ""),
-                    username=os.environ.get(sel.get("username_env", "SELECTEL_USERNAME"), ""),
-                    password=os.environ.get(sel.get("password_env", "SELECTEL_PASSWORD"), ""),
-                    project_id=os.environ.get(sel.get("project_id_env", "SELECTEL_PROJECT_ID"), "") or None,
+                    api_key=os.environ.get(sel.get("api_key_env", "SELECTEL_API_KEY"), ""),
+                    project_id=os.environ.get(sel.get("project_id_env", "SELECTEL_PROJECT_ID"), "") or "",
                     region=self._zone,
-                    proxy_url=sel.get("proxy_url") or _default_proxy,
-                    proxy_pool=proxy_pool,
+                    proxy_pool=resell_proxy_pool,
                 )]
 
         self._account_pool = AccountPool(self._clients)
@@ -545,7 +553,7 @@ class Orchestrator:
         sys.exit(130)
 
     # ------------------------------------------------------------------
-    # Phase 1: create FIPs up to MAX per account
+    # Phase 1: create FIPs up to MAX per account (bulk Resell API)
     # ------------------------------------------------------------------
 
     def _create_phase(self) -> None:
@@ -556,11 +564,11 @@ class Orchestrator:
                 continue
 
             try:
-                fips_count = len(client.list_floating_ips())
+                existing = client.list_floating_ips()
+                fips_count = len(existing)
             except Exception as exc:
                 log.warning("orch.list_fips_error",
                             account=getattr(client, "username", "?"), error=str(exc))
-                # Connection/timeout errors (status=0) are not rate-limits — skip block
                 if not (isinstance(exc, SelectelAPIError) and exc.status == 0):
                     self._account_pool.mark_rate_limited(
                         client,
@@ -568,36 +576,39 @@ class Orchestrator:
                     )
                 continue
 
-            while fips_count < MAX_FIPS_PER_ACCOUNT and self._running:
-                log.info("orch.creating_fip",
-                         account=client.username, slot=fips_count + 1)
-                try:
-                    fip = client.create_floating_ip_safe(
-                        availability_zone=getattr(client, "_region", self._zone),
+            quantity = MAX_FIPS_PER_ACCOUNT - fips_count
+            if quantity <= 0 or not self._running:
+                continue
+
+            log.info("orch.creating_fips_bulk",
+                     account=client.username, quantity=quantity)
+            try:
+                new_fips = client.create_floating_ips_bulk(quantity)
+            except SelectelRateLimitError:
+                self._account_pool.mark_rate_limited(
+                    client,
+                    datetime.now(timezone.utc) + timedelta(seconds=120),
+                )
+                continue
+            except Exception as exc:
+                err_str = str(exc)
+                log.warning("orch.fip_create_error",
+                            account=client.username, error=err_str)
+                if "ExternalIpAddressExhausted" in err_str:
+                    self._account_pool.mark_rate_limited(
+                        client,
+                        datetime.now(timezone.utc) + timedelta(seconds=30),
                     )
-                except SelectelRateLimitError:
+                elif "OverQuota" in err_str:
                     self._account_pool.mark_rate_limited(
                         client,
                         datetime.now(timezone.utc) + timedelta(seconds=120),
                     )
-                    break
-                except Exception as exc:
-                    err_str = str(exc)
-                    log.warning("orch.fip_create_error",
-                                account=client.username, error=err_str)
-                    if "ExternalIpAddressExhausted" in err_str:
-                        self._account_pool.mark_rate_limited(
-                            client,
-                            datetime.now(timezone.utc) + timedelta(seconds=30),
-                        )
-                    elif "OverQuota" in err_str:
-                        self._account_pool.mark_rate_limited(
-                            client,
-                            datetime.now(timezone.utc) + timedelta(seconds=120),
-                        )
-                    break
+                continue
 
-                fips_count += 1  # counts toward MAX even if we delete below
+            for fip in new_fips:
+                if not self._running:
+                    break
                 self.stats["total_created"] += 1
                 ip = fip.get("floating_ip_address", "")
                 if not ip:
@@ -615,8 +626,7 @@ class Orchestrator:
                     self._log_ip(ip, event="deleted", subnet=subnet,
                                  reason="not_in_whitelist", account=client.username)
                     self.stats["deleted_not_in_whitelist"] += 1
-                    log.info("orch.deleted_not_in_whitelist",
-                             ip=ip, subnet=subnet)
+                    log.info("orch.deleted_not_in_whitelist", ip=ip, subnet=subnet)
                     continue
 
                 if subnet in self._dead_subnets:

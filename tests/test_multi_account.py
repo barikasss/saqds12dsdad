@@ -93,26 +93,21 @@ def test_multi_account_rate_limit_failover():
 
 
 def test_selectel_rate_limit_error_is_raised(tmp_path):
-    """create_floating_ip_safe raises SelectelRateLimitError on 429."""
+    """create_floating_ips_bulk raises SelectelRateLimitError on quota_exceeded."""
     import responses as resp_lib
     from src.selectel_api import SelectelClient
 
-    url_base = "https://ru-2.cloud.api.selcloud.ru/network/v2.0"
-    identity_url = "https://cloud.api.selcloud.ru/identity/v3/auth/tokens"
+    create_url = "https://api.selectel.ru/vpc/resell/v2/floatingips/projects/proj-1"
 
     with resp_lib.RequestsMock() as rsps:
-        # auth
-        rsps.add(resp_lib.POST, identity_url, status=404)
-        # list networks
-        rsps.add(resp_lib.GET, f"{url_base}/networks",
-                 json={"networks": [{"id": "net-1"}]})
-        # POST floatingips → 429
-        rsps.add(resp_lib.POST, f"{url_base}/floatingips", status=429)
+        rsps.add(resp_lib.POST, create_url, status=429,
+                 json={"error": "quota_exceeded"})
 
         client = SelectelClient(
-            api_token="testtoken", region="ru-2"
+            account_id="acc-1", api_key="key-1",
+            project_id="proj-1", region="ru-2",
         )
         with pytest.raises(SelectelRateLimitError):
-            client.create_floating_ip_safe()
+            client.create_floating_ips_bulk(1)
 
 

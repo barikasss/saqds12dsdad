@@ -1,25 +1,24 @@
 selectel:
-  # Сервисный пользователь (password-метод Keystone) — single-account fallback
+  # Single-account fallback (legacy)
   account_id_env: SELECTEL_ACCOUNT_ID
-  username_env: SELECTEL_USERNAME
-  password_env: SELECTEL_PASSWORD
+  api_key_env: SELECTEL_API_KEY
   project_id_env: SELECTEL_PROJECT_ID
   availability_zone: ru-2
 
 # Мульти-аккаунт (опционально). Если задан — single-account секция игнорируется.
 selectel_accounts:
   - account_id: ""
-    username: ""
-    password_env: SELECTEL_PASSWORD_1
+    username: ""          # optional display name
+    api_key_env: SELECTEL_API_KEY_1
     project_id: ""
-    availability_zone: ru-2
+    availability_zone: ru-3
     enabled: true
   - account_id: ""
     username: ""
-    password_env: SELECTEL_PASSWORD_2
-    project_id_env: SELECTEL_PROJECT_ID_2
+    api_key_env: SELECTEL_API_KEY_2
+    project_id: ""
     availability_zone: ru-2
-    enabled: false  # включить когда есть второй аккаунт
+    enabled: false
 checkers:
   icmp:
     timeout: 1.0
