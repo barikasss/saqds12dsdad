@@ -242,6 +242,7 @@ class SelectelClient:
             return []
         network_id = self._get_network_id()
         fips = []
+        consecutive_exhausted = 0
         for _ in range(quantity):
             resp = self._ks_request(
                 "POST", f"{self._net_base}/floatingips",
@@ -249,8 +250,16 @@ class SelectelClient:
             )
             if resp.status_code == 429:
                 raise SelectelRateLimitError(429, resp.text)
+            if resp.status_code == 400 and "ExternalIpAddressExhausted" in resp.text:
+                consecutive_exhausted += 1
+                if consecutive_exhausted >= 3:
+                    raise SelectelAPIError(resp.status_code, resp.text)
+                log.warning("selectel.exhausted_rotate_proxy",
+                            account=self.username, attempt=consecutive_exhausted)
+                continue  # _ks_request rotates proxy on next call
             if not resp.ok:
                 raise SelectelAPIError(resp.status_code, resp.text)
+            consecutive_exhausted = 0
             fip = resp.json()["floatingip"]
             # Normalize to match Resell response format
             fip.setdefault("region", self._region)
