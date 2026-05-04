@@ -599,7 +599,7 @@ class Orchestrator:
                         client,
                         datetime.now(timezone.utc) + timedelta(seconds=30),
                     )
-                elif "OverQuota" in err_str:
+                elif "OverQuota" in err_str or "quota_exceeded" in err_str:
                     self._account_pool.mark_rate_limited(
                         client,
                         datetime.now(timezone.utc) + timedelta(seconds=120),

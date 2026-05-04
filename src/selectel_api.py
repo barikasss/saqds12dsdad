@@ -140,15 +140,17 @@ class SelectelClient:
             json={"floatingips": [{"region": self._region, "quantity": quantity}]},
         )
 
-        if resp.status_code == 429:
-            raise SelectelRateLimitError(429, resp.text)
+        if resp.status_code in (429, 409):
+            try:
+                if resp.json().get("error") == "quota_exceeded":
+                    raise SelectelRateLimitError(resp.status_code, resp.text)
+            except (ValueError, SelectelRateLimitError):
+                raise
+            except Exception:
+                pass
 
         if not resp.ok:
             raise SelectelAPIError(resp.status_code, resp.text)
-
-        body = resp.json()
-        if body.get("error") == "quota_exceeded":
-            raise SelectelRateLimitError(429, resp.text)
 
         fips: list[dict] = body.get("floatingips", [])
         for fip in fips:
